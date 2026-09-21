@@ -1,5 +1,6 @@
 """
-Панель старосты: обновлённый список студентов, скрытые логины/пароли, полные права для 3 ролей.
+Панель старосты: студенты видят только домашку, авто-сетка посещаемости на 5 дней,
+актуальный список группы ИС-116 + Егор Середа.
 """
 
 import streamlit as st
@@ -8,7 +9,7 @@ import os
 import hashlib
 import secrets
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==================== НАСТРОЙКИ ====================
 st.set_page_config(
@@ -36,6 +37,7 @@ ROLE_PERMISSIONS = {
         "can_manage_tasks": True,
         "can_edit_notes": True,
         "can_export": True,
+        "can_view_tasks": True,
     },
     "zam": {
         "can_manage_students": True,
@@ -43,6 +45,7 @@ ROLE_PERMISSIONS = {
         "can_manage_tasks": True,
         "can_edit_notes": True,
         "can_export": True,
+        "can_view_tasks": True,
     },
     "kurator": {
         "can_manage_students": True,
@@ -50,7 +53,16 @@ ROLE_PERMISSIONS = {
         "can_manage_tasks": True,
         "can_edit_notes": True,
         "can_export": True,
+        "can_view_tasks": True,
     },
+    "student": {
+        "can_manage_students": False,
+        "can_edit_attendance": False,
+        "can_manage_tasks": False,
+        "can_edit_notes": False,
+        "can_export": False,
+        "can_view_tasks": True,  # Студенты видят только задания
+    }
 }
 
 # ==================== УТИЛИТЫ ====================
@@ -65,7 +77,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
         salt, h = stored_hash.split("\$", 1)
         computed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
         return computed.hex() == h
-    # Совместимость со старыми голыми SHA256-хешами
     return hashlib.sha256(password.encode("utf-8")).hexdigest() == stored_hash
 
 
@@ -85,7 +96,6 @@ def save_json(path, data):
 
 
 def col_letter(n):
-    """Конвертирует номер колонки в буквенный адрес (1 -> A, 27 -> AA)."""
     result = ""
     while n > 0:
         n, rem = divmod(n - 1, 26)
@@ -93,6 +103,7 @@ def col_letter(n):
     return result
 
 
+# Дефолтные пользователи: староста, зам, куратор + 1 тестовый студент
 DEFAULT_USERS = {
     "starosta": {
         "password": hash_password("starosta123"),
@@ -108,10 +119,15 @@ DEFAULT_USERS = {
         "password": hash_password("kurator123"),
         "role": "kurator",
         "name": "Куратор группы"
+    },
+    "student_test": {
+        "password": hash_password("student123"),
+        "role": "student",
+        "name": "Студент (тестовый)"
     }
 }
 
-# ОБНОВЛЁННЫЙ СПИСОК СТУДЕНТОВ (31 человек, включая Егора Середу)
+# Список студентов строго по фото + Егор Середа
 DEFAULT_STUDENTS = [
     "Абукаева Дилара Ринатовна",
     "Бакаляров Кирилл Николаевич",
@@ -143,7 +159,7 @@ DEFAULT_STUDENTS = [
     "Пимкина Дарья Викторовна",
     "Плотников Артём Ильич",
     "Порубов Никита Константинович",
-    "Середа Егор"  # Новенький, отчество пока неизвестно
+    "Середа Егор"  # Новенький
 ]
 
 # ==================== ЭКСПОРТ В GOOGLE SHEETS ====================
@@ -250,7 +266,7 @@ def login_screen():
             else:
                 st.error("Неверный логин или пароль")
 
-        # ПОДСКАЗКА С ЛОГИНАМИ И ПАРОЛЯМИ УДАЛЕНА
+        # Подсказка с логинами и паролями удалена
 
 
 # ==================== ГЛАВНЫЙ ЭКРАН ====================
@@ -259,6 +275,7 @@ def main_app():
     role = user["role"]
     perms = ROLE_PERMISSIONS.get(role, {})
     is_admin = perms.get("can_manage_students", False)
+    can_view_tasks = perms.get("can_view_tasks", False)
 
     # Загрузка данных
     students = load_json(STUDENTS_FILE, [])
@@ -277,18 +294,27 @@ def main_app():
         role_names = {
             "starosta": "🟢 Староста",
             "zam": "🟡 Заместитель",
-            "kurator": "🔵 Куратор"
+            "kurator": "🔵 Куратор",
+            "student": "🟣 Студент"
         }
         st.info(role_names.get(role, role))
 
         st.divider()
-        menu = st.radio("Меню", [
-            "👥 Студенты",
-            "📅 Посещаемость",
-            "📝 Задания",
-            "🗒 Заметки",
-            "🔑 Сменить пароль"
-        ])
+        menu_options = []
+        if is_admin:
+            menu_options.extend(["👥 Студенты", "📅 Посещаемость"])
+        if perms.get("can_manage_tasks", False):
+            menu_options.append("📝 Задания")
+        if perms.get("can_edit_notes", False):
+            menu_options.append("🗒 Заметки")
+        if can_view_tasks and "📝 Задания" not in menu_options:
+            menu_options.append("📝 Задания")
+        if perms.get("can_export", False):
+            menu_options.append("🔑 Сменить пароль")
+        else:
+            menu_options.append("🔑 Сменить пароль")
+
+        menu = st.radio("Меню", menu_options)
 
         if perms.get("can_export", False):
             st.divider()
@@ -321,7 +347,6 @@ def main_app():
     if menu == "👥 Студенты":
         st.header("👥 Список группы")
 
-        # Добавление
         if is_admin:
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -333,12 +358,10 @@ def main_app():
                 if st.button("➕ Добавить", use_container_width=True):
                     if new_name.strip() and new_name.strip() not in students:
                         students.append(new_name.strip())
-                        # Сортировка по алфавиту после добавления
                         students.sort()
                         save_json(STUDENTS_FILE, students)
                         st.rerun()
 
-        # Таблица
         if students:
             df = pd.DataFrame({"№": range(1, len(students) + 1),
                                "ФИО": students})
@@ -346,8 +369,6 @@ def main_app():
 
             if is_admin:
                 st.divider()
-
-                # Изменение ФИО
                 st.subheader("✏️ Изменить ФИО")
                 edit_name = st.selectbox("Выберите студента",
                                          ["—"] + students,
@@ -359,11 +380,9 @@ def main_app():
                         if new_val.strip() and new_val.strip() != edit_name:
                             idx = students.index(edit_name)
                             students[idx] = new_val.strip()
-                            # Обновляем записи посещаемости
                             for day_data in attendance.values():
                                 if edit_name in day_data:
                                     day_data[new_val.strip()] = day_data.pop(edit_name)
-                            # Сортировка после изменения
                             students.sort()
                             save_json(STUDENTS_FILE, students)
                             save_json(ATTENDANCE_FILE, attendance)
@@ -371,8 +390,6 @@ def main_app():
                             st.rerun()
 
                 st.divider()
-
-                # Удаление
                 st.subheader("🗑 Удалить студента")
                 to_del = st.selectbox("Выберите студента для удаления",
                                       ["—"] + students,
@@ -394,23 +411,44 @@ def main_app():
         if not students:
             st.warning("Сначала добавьте студентов")
         else:
-            date = st.date_input("Дата", datetime.now()).strftime("%Y-%m-%d")
-            day_data = attendance.get(date, {})
+            # АВТО-ГЕНЕРАЦИЯ СЕТКИ НА 5 ДНЕЙ ВПЕРЁД (до пятницы)
+            today = datetime.now()
+            # Находим ближайший понедельник или текущий день, если это пн-пт
+            # Но по ТЗ: если сегодня 21 число, нужна сетка до пятницы.
+            # Будем брать 5 дней начиная с сегодняшнего
+            dates_to_show = []
+            current = today
+            count = 0
+            while count < 5:
+                # Пропускаем субботу и воскресенье
+                if current.weekday() < 5:
+                    dates_to_show.append(current.strftime("%Y-%m-%d"))
+                    count += 1
+                current += timedelta(days=1)
 
-            st.write(f"### Отметка на **{date}**")
+            st.write("### Сетка посещаемости (автоматически на 5 учебных дней)")
+            
+            # Отображаем даты в шапке
+            st.write(f"**Даты для отметки:** {', '.join(dates_to_show)}")
 
-            new_day = {}
-            cols = st.columns(3)
-            for i, s in enumerate(students):
-                with cols[i % 3]:
-                    val = st.checkbox(s, value=day_data.get(s, True),
-                                      key=f"att_{date}_{i}")
-                    new_day[s] = val
+            # Для каждой даты показываем чекбоксы
+            for date in dates_to_show:
+                st.write(f"#### Отметка на **{date}**")
+                day_data = attendance.get(date, {})
+                new_day = {}
+                
+                # Разбиваем студентов на колонки для компактности
+                cols = st.columns(3)
+                for i, s in enumerate(students):
+                    with cols[i % 3]:
+                        val = st.checkbox(s, value=day_data.get(s, True),
+                                          key=f"att_{date}_{i}")
+                        new_day[s] = val
 
-            if st.button("💾 Сохранить посещаемость", type="primary"):
-                attendance[date] = new_day
-                save_json(ATTENDANCE_FILE, attendance)
-                st.success(f"Сохранено на {date}")
+                if st.button(f"💾 Сохранить для {date}", type="primary", key=f"save_{date}"):
+                    attendance[date] = new_day
+                    save_json(ATTENDANCE_FILE, attendance)
+                    st.success(f"Посещаемость на {date} сохранена")
 
             if attendance:
                 st.divider()
@@ -421,9 +459,9 @@ def main_app():
 
     # ==================== СТРАНИЦА: ЗАДАНИЯ ====================
     elif menu == "📝 Задания":
-        st.header("📝 Задания группы")
+        st.header("📝 Задания / Домашка")
 
-        if is_admin:
+        if perms.get("can_manage_tasks", False):
             with st.form("add_task"):
                 c1, c2, c3 = st.columns([3, 2, 1])
                 with c1:
@@ -457,14 +495,16 @@ def main_app():
                 with c2:
                     st.write(f"до {t['deadline']}")
                 with c3:
-                    if is_admin:
+                    # Кнопка смены статуса видна только админам
+                    if perms.get("can_manage_tasks", False):
                         label = "↩️" if t["done"] else "✅"
                         if st.button(label, key=f"toggle_{i}"):
                             tasks[i]["done"] = not tasks[i]["done"]
                             save_json(TASKS_FILE, tasks)
                             st.rerun()
                 with c4:
-                    if is_admin:
+                    # Кнопка удаления видна только админам
+                    if perms.get("can_manage_tasks", False):
                         if st.button("🗑", key=f"del_{i}"):
                             del tasks[i]
                             save_json(TASKS_FILE, tasks)
@@ -475,7 +515,7 @@ def main_app():
     # ==================== СТРАНИЦА: ЗАМЕТКИ ====================
     elif menu == "🗒 Заметки":
         st.header("🗒 Заметки")
-        if is_admin:
+        if perms.get("can_edit_notes", False):
             text = st.text_area("Заметки", value=notes_text, height=400)
             if st.button("💾 Сохранить", type="primary"):
                 save_json(NOTES_FILE, text)
