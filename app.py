@@ -1,8 +1,3 @@
-"""
-Панель старосты: студенты видят только домашку, авто-сетка посещаемости на 5 дней,
-актуальный список группы ИС-116 + Егор Середа.
-"""
-
 import streamlit as st
 import json
 import os
@@ -61,7 +56,7 @@ ROLE_PERMISSIONS = {
         "can_manage_tasks": False,
         "can_edit_notes": False,
         "can_export": False,
-        "can_view_tasks": True,  # Студенты видят только задания
+        "can_view_tasks": True,
     }
 }
 
@@ -103,7 +98,7 @@ def col_letter(n):
     return result
 
 
-# Дефолтные пользователи: староста, зам, куратор + 1 тестовый студент
+# Дефолтные пользователи
 DEFAULT_USERS = {
     "starosta": {
         "password": hash_password("starosta123"),
@@ -159,33 +154,37 @@ DEFAULT_STUDENTS = [
     "Пимкина Дарья Викторовна",
     "Плотников Артём Ильич",
     "Порубов Никита Константинович",
-    "Середа Егор"  # Новенький
+    "Середа Егор"
 ]
 
 # ==================== ЭКСПОРТ В GOOGLE SHEETS ====================
-def export_to_google_sheets(spreadsheet_id, students, attendance, tasks,
-                             creds_path=CREDS_FILE):
+def export_to_google_sheets(spreadsheet_id, students, attendance, tasks):
     try:
         import gspread
         from google.oauth2.service_account import Credentials
+        import json
+        import os
     except ImportError:
-        raise RuntimeError(
-            "Библиотеки не установлены. Выполните: "
-            "pip install gspread google-auth"
-        )
+        raise RuntimeError("Установите библиотеки: pip install gspread google-auth")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
 
-    if not os.path.exists(creds_path):
-        raise FileNotFoundError(
-            f"Файл '{creds_path}' не найден. "
-            "Скачайте JSON-ключ сервисного аккаунта и положите рядом с app.py"
-        )
+    # Сначала пробуем взять ключ из Secrets в Streamlit Cloud
+    creds_content = os.environ.get("CREDS_JSON")
+    
+    if creds_content:
+        creds_data = json.loads(creds_content)
+    else:
+        # Если секрета нет (например, запускаешь локально), пробуем взять из файла
+        if not os.path.exists(CREDS_FILE):
+            raise FileNotFoundError("Не найден файл credentials.json и нет переменной CREDS_JSON")
+        with open(CREDS_FILE, "r", encoding="utf-8") as f:
+            creds_data = json.load(f)
 
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(spreadsheet_id)
 
@@ -266,8 +265,6 @@ def login_screen():
             else:
                 st.error("Неверный логин или пароль")
 
-        # Подсказка с логинами и паролями удалена
-
 
 # ==================== ГЛАВНЫЙ ЭКРАН ====================
 def main_app():
@@ -309,10 +306,8 @@ def main_app():
             menu_options.append("🗒 Заметки")
         if can_view_tasks and "📝 Задания" not in menu_options:
             menu_options.append("📝 Задания")
-        if perms.get("can_export", False):
-            menu_options.append("🔑 Сменить пароль")
-        else:
-            menu_options.append("🔑 Сменить пароль")
+        
+        menu_options.append("🔑 Сменить пароль")
 
         menu = st.radio("Меню", menu_options)
 
@@ -336,214 +331,113 @@ def main_app():
             if st.button("Начать экспорт"):
                 try:
                     url = export_to_google_sheets(sid, students, attendance, tasks)
-                    st.success(f"✅ Готово! [Открыть таблицу]({url})")
+                    st.success(f"✅ Готово! Ссылка на таблицу: {url}")
                 except Exception as e:
-                    st.error(f"Ошибка: {e}")
-            if st.button("Закрыть"):
-                st.session_state.show_export = False
+                    st.error(f"❌ Ошибка экспорта: {e}")
+
+    # --- Логика вкладок ---
+    if menu == "👥 Студенты" and is_admin:
+        st.header("👥 Список студентов")
+        st.write(f"Всего студентов: {len(students)}")
+        st.dataframe(students, use_container_width=True)
+        
+        if st.button("🔄 Обновить список до дефолтного"):
+            students = DEFAULT_STUDENTS.copy()
+            save_json(STUDENTS_FILE, students)
+            st.rerun()
+
+    elif menu == "📅 Посещаемость" and is_admin:
+        st.header("📅 Посещаемость (авто-сетка на 5 дней)")
+        
+        # Генерация дат для сетки (5 дней вперед)
+        dates = [(datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(5)]
+        
+        # Инициализация посещаемости, если пусто
+        if not attendance:
+            for d in dates:
+                attendance[d] = {s: True for s in students}
+            save_json(ATTENDANCE_FILE, attendance)
+
+        st.write("Даты для заполнения:")
+        st.write(", ".join(dates))
+
+        # Простая форма редактирования (чекбоксы)
+        for date in dates:
+            st.subheader(date)
+            cols = st.columns(min(len(students), 5)) # Чтобы не было слишком много колонок
+            for i, student in enumerate(students):
+                if len(cols) > i:
+                    default_val = attendance.get(date, {}).get(student, True)
+                    attendance[date][student] = st.checkbox(student, value=default_val, key=f"{date}_{student}")
+            
+        if st.button("💾 Сохранить посещаемость", use_container_width=True):
+            save_json(ATTENDANCE_FILE, attendance)
+            st.success("Посещаемость сохранена!")
+
+    elif menu == "📝 Задания":
+        st.header("📝 Задания (Домашка)")
+        
+        # Форма добавления задания
+        with st.form("add_task"):
+            title = st.text_input("Название задания")
+            deadline = st.date_input("Дедлайн")
+            done = st.checkbox("Выполнено")
+            if st.form_submit_button("Добавить задание"):
+                tasks.append({
+                    "title": title,
+                    "deadline": str(deadline),
+                    "done": done
+                })
+                save_json(TASKS_FILE, tasks)
                 st.rerun()
 
-    # ==================== СТРАНИЦА: СТУДЕНТЫ ====================
-    if menu == "👥 Студенты":
-        st.header("👥 Список группы")
-
-        if is_admin:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                new_name = st.text_input("ФИО нового студента",
-                                          placeholder="Иванов Иван Иванович")
-            with col2:
-                st.write("")
-                st.write("")
-                if st.button("➕ Добавить", use_container_width=True):
-                    if new_name.strip() and new_name.strip() not in students:
-                        students.append(new_name.strip())
-                        students.sort()
-                        save_json(STUDENTS_FILE, students)
-                        st.rerun()
-
-        if students:
-            df = pd.DataFrame({"№": range(1, len(students) + 1),
-                               "ФИО": students})
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-            if is_admin:
-                st.divider()
-                st.subheader("✏️ Изменить ФИО")
-                edit_name = st.selectbox("Выберите студента",
-                                         ["—"] + students,
-                                         key="edit_student_select")
-                if edit_name != "—":
-                    new_val = st.text_input("Новое ФИО", value=edit_name,
-                                            key="edit_student_input")
-                    if st.button("💾 Сохранить", type="primary"):
-                        if new_val.strip() and new_val.strip() != edit_name:
-                            idx = students.index(edit_name)
-                            students[idx] = new_val.strip()
-                            for day_data in attendance.values():
-                                if edit_name in day_data:
-                                    day_data[new_val.strip()] = day_data.pop(edit_name)
-                            students.sort()
-                            save_json(STUDENTS_FILE, students)
-                            save_json(ATTENDANCE_FILE, attendance)
-                            st.success(f"ФИО изменено: {edit_name} → {new_val.strip()}")
-                            st.rerun()
-
-                st.divider()
-                st.subheader("🗑 Удалить студента")
-                to_del = st.selectbox("Выберите студента для удаления",
-                                      ["—"] + students,
-                                      key="del_student_select")
-                if to_del != "—" and st.button("🗑 Удалить", type="secondary"):
-                    students.remove(to_del)
-                    for day_data in attendance.values():
-                        day_data.pop(to_del, None)
-                    save_json(STUDENTS_FILE, students)
-                    save_json(ATTENDANCE_FILE, attendance)
-                    st.rerun()
-        else:
-            st.info("Список пуст. Добавьте студентов.")
-
-    # ==================== СТРАНИЦА: ПОСЕЩАЕМОСТЬ ====================
-    elif menu == "📅 Посещаемость":
-        st.header("📅 Посещаемость")
-
-        if not students:
-            st.warning("Сначала добавьте студентов")
-        else:
-            # АВТО-ГЕНЕРАЦИЯ СЕТКИ НА 5 ДНЕЙ ВПЕРЁД (до пятницы)
-            today = datetime.now()
-            # Находим ближайший понедельник или текущий день, если это пн-пт
-            # Но по ТЗ: если сегодня 21 число, нужна сетка до пятницы.
-            # Будем брать 5 дней начиная с сегодняшнего
-            dates_to_show = []
-            current = today
-            count = 0
-            while count < 5:
-                # Пропускаем субботу и воскресенье
-                if current.weekday() < 5:
-                    dates_to_show.append(current.strftime("%Y-%m-%d"))
-                    count += 1
-                current += timedelta(days=1)
-
-            st.write("### Сетка посещаемости (автоматически на 5 учебных дней)")
-            
-            # Отображаем даты в шапке
-            st.write(f"**Даты для отметки:** {', '.join(dates_to_show)}")
-
-            # Для каждой даты показываем чекбоксы
-            for date in dates_to_show:
-                st.write(f"#### Отметка на **{date}**")
-                day_data = attendance.get(date, {})
-                new_day = {}
-                
-                # Разбиваем студентов на колонки для компактности
-                cols = st.columns(3)
-                for i, s in enumerate(students):
-                    with cols[i % 3]:
-                        val = st.checkbox(s, value=day_data.get(s, True),
-                                          key=f"att_{date}_{i}")
-                        new_day[s] = val
-
-                if st.button(f"💾 Сохранить для {date}", type="primary", key=f"save_{date}"):
-                    attendance[date] = new_day
-                    save_json(ATTENDANCE_FILE, attendance)
-                    st.success(f"Посещаемость на {date} сохранена")
-
-            if attendance:
-                st.divider()
-                st.subheader("📊 Сводка по датам")
-                summary = pd.DataFrame(attendance).T
-                summary.index.name = "Дата"
-                st.dataframe(summary, use_container_width=True)
-
-    # ==================== СТРАНИЦА: ЗАДАНИЯ ====================
-    elif menu == "📝 Задания":
-        st.header("📝 Задания / Домашка")
-
-        if perms.get("can_manage_tasks", False):
-            with st.form("add_task"):
-                c1, c2, c3 = st.columns([3, 2, 1])
-                with c1:
-                    title = st.text_input("Задание")
-                with c2:
-                    deadline = st.text_input("Дедлайн (ГГГГ-ММ-ДД)",
-                                              value=datetime.now().strftime("%Y-%m-%d"))
-                with c3:
-                    st.write("")
-                    st.write("")
-                    submit = st.form_submit_button("➕ Добавить")
-                if submit and title.strip():
-                    try:
-                        datetime.strptime(deadline.strip(), "%Y-%m-%d")
-                    except ValueError:
-                        st.error("Дедлайн должен быть в формате ГГГГ-ММ-ДД")
-                    else:
-                        tasks.append({"title": title.strip(),
-                                      "deadline": deadline.strip(),
-                                      "done": False})
-                        save_json(TASKS_FILE, tasks)
-                        st.rerun()
-
+        # Отображение списка
         if tasks:
-            today = datetime.now().strftime("%Y-%m-%d")
-            for i, t in enumerate(tasks):
-                mark = "✅" if t["done"] else ("⚠️" if t["deadline"] < today else "⏳")
-                c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
-                with c1:
-                    st.write(f"{mark} **{t['title']}**")
-                with c2:
-                    st.write(f"до {t['deadline']}")
-                with c3:
-                    # Кнопка смены статуса видна только админам
-                    if perms.get("can_manage_tasks", False):
-                        label = "↩️" if t["done"] else "✅"
-                        if st.button(label, key=f"toggle_{i}"):
-                            tasks[i]["done"] = not tasks[i]["done"]
-                            save_json(TASKS_FILE, tasks)
-                            st.rerun()
-                with c4:
-                    # Кнопка удаления видна только админам
-                    if perms.get("can_manage_tasks", False):
-                        if st.button("🗑", key=f"del_{i}"):
-                            del tasks[i]
-                            save_json(TASKS_FILE, tasks)
-                            st.rerun()
+            df_tasks = pd.DataFrame(tasks)
+            st.dataframe(df_tasks, use_container_width=True)
         else:
             st.info("Заданий пока нет")
 
-    # ==================== СТРАНИЦА: ЗАМЕТКИ ====================
-    elif menu == "🗒 Заметки":
-        st.header("🗒 Заметки")
-        if perms.get("can_edit_notes", False):
-            text = st.text_area("Заметки", value=notes_text, height=400)
-            if st.button("💾 Сохранить", type="primary"):
-                save_json(NOTES_FILE, text)
-                st.success("Заметки сохранены")
-        else:
-            st.text_area("Заметки (только чтение)", value=notes_text,
-                         height=400, disabled=True)
+    elif menu == "🗒 Заметки" and perms.get("can_edit_notes", False):
+        st.header("🗒 Общие заметки")
+        notes_text = st.text_area("Текст заметки", value=notes_text, height=200)
+        if st.button("Сохранить заметку"):
+            save_json(NOTES_FILE, notes_text)
+            st.success("Заметка сохранена!")
 
-    # ==================== СТРАНИЦА: СМЕНА ПАРОЛЯ ====================
     elif menu == "🔑 Сменить пароль":
-        st.header("🔑 Смена пароля")
-        with st.form("change_pass"):
-            old = st.text_input("Старый пароль", type="password")
-            new = st.text_input("Новый пароль", type="password")
-            confirm = st.text_input("Повторите новый", type="password")
-            submit = st.form_submit_button("Сохранить")
-
-            if submit:
-                if not verify_password(old, users[user["login"]]["password"]):
-                    st.error("Старый пароль неверный")
-                elif len(new) < 4:
-                    st.error("Пароль слишком короткий (минимум 4 символа)")
-                elif new != confirm:
-                    st.error("Пароли не совпадают")
-                else:
-                    users[user["login"]]["password"] = hash_password(new)
+        st.header("🔐 Смена пароля")
+        old_pass = st.text_input("Старый пароль", type="password")
+        new_pass = st.text_input("Новый пароль", type="password")
+        confirm_pass = st.text_input("Подтвердите новый пароль", type="password")
+        
+        if st.button("Изменить пароль"):
+            current_user_data = users.get(user["login"])
+            if current_user_data and verify_password(old_pass, current_user_data["password"]):
+                if new_pass == confirm_pass and len(new_pass) >= 4:
+                    current_user_data["password"] = hash_password(new_pass)
                     save_json(USERS_FILE, users)
-                    st.success("Пароль изменён!")
+                    st.success("Пароль успешно изменен!")
+                else:
+                    st.error("Пароли не совпадают или слишком короткие")
+            else:
+                st.error("Неверный старый пароль")
+
+    else:
+        # Экран по умолчанию (для студентов или главная)
+        st.title("🎓 Панель старосты группы ИС-116")
+        st.markdown(f"Привет, {user['name']}! Выбери раздел в меню слева.")
+        
+        if role == "student":
+            st.info("📋 Как студент, вы видите только список заданий (вкладка «Задания»).")
+            # Дублируем логику заданий для быстрого доступа студентам
+            if tasks:
+                st.subheader("Ваша домашка:")
+                for t in tasks:
+                    status = "✅ Выполнено" if t["done"] else "⏳ В работе"
+                    st.markdown(f"- **{t['title']}** (Дедлайн: {t['deadline']}) — {status}")
+            else:
+                st.info("Заданий пока нет.")
 
 
 # ==================== ЗАПУСК ====================
