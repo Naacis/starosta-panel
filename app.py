@@ -4,29 +4,19 @@ import os
 import hashlib
 import secrets
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import gspread
 from google.oauth2.service_account import Credentials
 
 # ==================== НАСТРОЙКИ ====================
 st.set_page_config(page_title="Панель старосты ИС-116", page_icon="🎓", layout="wide")
 
-WEEK_DAYS = ["понед", "втор", "среда", "чтв", "пятн", "суб"]  # 6 дней
-SUB_COLS = ["1", "2", "3"]                                    # 3 пары в день
-HOURS_PER_SUB = 2                                             # 1 пара = 2 акад. часа
+WEEK_DAYS = ["понед", "втор", "среда", "чтв", "пятн", "суб"]
+SUB_COLS = ["1", "2", "3"]
+HOURS_PER_SUB = 2
 
-# "" — пусто, П — присутствовал, Н — неуваж., Б — болен (уваж.), О — опоздал
 STATUS_OPTIONS = ["", "П", "Н", "Б", "О"]
 
-# Всего колонок A..Y = 25:
-#   A           — №
-#   B           — ФИО
-#   C..T (18)   — 6 дней × 3 пары
-#   U           — Всего пропусков (акад. часов)
-#   V           — Уважит. причина (часы)
-#   W           — Неуваж. причина (часы)
-#   X           — Количество опозданий
-#   Y           — подпись старосты и классного руководителя
 TOTAL_COLS = 2 + len(WEEK_DAYS) * len(SUB_COLS) + 5  # = 25
 
 
@@ -126,7 +116,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def col_letter(n):
-    """1 -> A, 2 -> B, ..., 27 -> AA."""
     result = ""
     while n > 0:
         n, rem = divmod(n - 1, 26)
@@ -134,17 +123,56 @@ def col_letter(n):
     return result
 
 
+def parse_date(s):
+    """Аккуратно парсит дату из строки; возвращает date или None."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+# ==================== ЗАДАЧИ ====================
+def add_task(tasks, title, subject, deadline, description, priority):
+    tasks.append({
+        "id": secrets.token_hex(6),
+        "title": title.strip(),
+        "subject": subject.strip(),
+        "deadline": str(deadline),
+        "description": description.strip(),
+        "priority": priority,
+        "done": False,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+    return tasks
+
+
+def delete_task(tasks, task_id):
+    return [t for t in tasks if t.get("id") != task_id]
+
+
+def toggle_task(tasks, task_id):
+    for t in tasks:
+        if t.get("id") == task_id:
+            t["done"] = not t.get("done", False)
+    return tasks
+
+
+def update_task(tasks, task_id, **fields):
+    for t in tasks:
+        if t.get("id") == task_id:
+            t.update(fields)
+    return tasks
+
+
+PRIORITY_OPTIONS = ["🔴 Высокий", "🟡 Средний", "🟢 Низкий"]
+
+
 # ==================== ЭКСПОРТ ОТЧЁТА ЗА НЕДЕЛЮ ====================
 def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
-    """
-    Экспортирует отчёт за неделю в лист «Посещаемость» — структура 1:1 как в шаблоне.
-
-      A              B                 C D E   F G H   I J K   L M N   O P Q   R S T   U             V         W           X          Y
-    1 Группа ИС-116                   [понед]  [втор]  [среда] [чтв]   [пятн]  [суб]   Учебная неделя №
-    2                                [           — пусто —                 ]          Всего пропусков  Из них   Кол-во опозн.
-    3               ФИО студента     [           — пусто —                 ]                   Уваж.   Неуваж.
-    4  1  Абукаева Дилара ...        . . .   . . .   Н Н Н   . . .   Н . .   . . .    7       6       1        Староста ______ / Кл.рук.______
-    """
     today = datetime.now()
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=int(week_offset))
     dates_in_week = [
@@ -152,7 +180,6 @@ def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
         for i in range(len(WEEK_DAYS))
     ]
 
-    # --- Получаем или создаём лист ---
     title = "Посещаемость"
     try:
         ws = sheet.worksheet(title)
@@ -168,74 +195,65 @@ def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
             cols=30,
         )
 
-    # ---------- ШАПКА (3 строки × 25 колонок A..Y) ----------
-    # Индексы (0-based): A=0, B=1, C=2, D=3, ..., T=19, U=20, V=21, W=22, X=23, Y=24
-
     row1 = [""] * TOTAL_COLS
-    row1[0] = "Группа ИС-116"                          # A1
+    row1[0] = "Группа ИС-116"
     for i, day in enumerate(WEEK_DAYS):
-        row1[2 + i * len(SUB_COLS)] = day              # C1, F1, I1, L1, O1, R1
-    row1[20] = "Учебная неделя     №"                  # U1  (merge U1:Y1)
+        row1[2 + i * len(SUB_COLS)] = day
+    row1[20] = "Учебная неделя     №"
 
     row2 = [""] * TOTAL_COLS
-    row2[20] = "Всего пропусков (акад.часов)"          # U2  (merge U2:U3)
-    row2[21] = "Из них"                                # V2  (merge V2:W2)
-    row2[23] = "Количество опозданий"                  # X2  (merge X2:Y2)
+    row2[20] = "Всего пропусков (акад.часов)"
+    row2[21] = "Из них"
+    row2[23] = "Количество опозданий"
 
     row3 = [""] * TOTAL_COLS
-    row3[1] = "ФИО студента"                           # B3
-    row3[21] = "Уважит. Причина"                       # V3
-    row3[22] = "Неуваж. причина"                       # W3
+    row3[1] = "ФИО студента"
+    row3[21] = "Уважит. Причина"
+    row3[22] = "Неуваж. причина"
 
     ws.update("A1", [row1, row2, row3])
 
-    # ---------- ДАННЫЕ СТУДЕНТОВ (начиная с 4-й строки) ----------
     data_rows = []
     for idx, name in enumerate(students, 1):
         row = [idx, name]
-        u_hours = 0   # уважительные часы (по метке Б)
-        n_hours = 0   # неуважительные часы (по метке Н)
-        lates = 0     # количество опозданий (по метке О)
+        u_hours = 0
+        n_hours = 0
+        lates = 0
 
-        # 18 колонок отметок: 6 дней × 3 пары
         for d_str in dates_in_week:
             day_data = attendance.get(d_str, {}).get(name, {}) or {}
             for sub in SUB_COLS:
                 status = (day_data.get(sub, "") or "").strip()
                 if status == "Н":
-                    row.append("Н")
-                    n_hours += HOURS_PER_SUB
+                    row.append("Н"); n_hours += HOURS_PER_SUB
                 elif status == "Б":
-                    row.append("Б")
-                    u_hours += HOURS_PER_SUB
+                    row.append("Б"); u_hours += HOURS_PER_SUB
                 elif status == "О":
-                    row.append("О")
-                    lates += 1
+                    row.append("О"); lates += 1
                 elif status == "П":
                     row.append("П")
                 else:
                     row.append("")
 
         total_hours = u_hours + n_hours
-        row.append(total_hours if total_hours else "")   # U — Всего пропусков
-        row.append(u_hours if u_hours else "")           # V — Уважит. причина
-        row.append(n_hours if n_hours else "")           # W — Неуваж. причина
-        row.append(lates if lates else "")               # X — Количество опозданий
-        row.append("")                                    # Y — подпись (заполним ниже)
+        row.append(total_hours if total_hours else "")
+        row.append(u_hours if u_hours else "")
+        row.append(n_hours if n_hours else "")
+        row.append(lates if lates else "")
+        row.append("")
         data_rows.append(row)
 
     if data_rows:
         ws.update("A4", data_rows)
 
-    # ---------- ОБЪЕДИНЕНИЯ ЯЧЕЕК ----------
     merges = [
-        "A1:A3",                                                  # "Группа ИС-116"
-        "C1:E1", "F1:H1", "I1:K1", "L1:N1", "O1:Q1", "R1:T1",     # названия дней
-        "C2:T3",                                                   # пустая зона под днями
-        "U1:Y1",                                                   # "Учебная неделя №"
-        "U2:U3",                                                   # "Всего пропусков"
-        "V2:W2",                                                   # "Из них"
-        "X2:Y2",                                                   # "Количество опозданий"
+        "A1:A3",
+        "C1:E1", "F1:H1", "I1:K1", "L1:N1", "O1:Q1", "R1:T1",
+        "C2:T3",
+        "U1:Y1",
+        "U2:U3",
+        "V2:W2",
+        "X2:Y2",
     ]
     for m in merges:
         try:
@@ -243,7 +261,6 @@ def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
         except Exception:
             pass
 
-    # ---------- Строка для подписей (в колонке Y, объединена по всем студентам) ----------
     if data_rows:
         last_row = 3 + len(data_rows)
         sig_text = (
@@ -256,7 +273,6 @@ def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
         except Exception:
             pass
 
-    # ---------- Форматирование ----------
     try:
         ws.format(
             "A1:Y3",
@@ -295,12 +311,14 @@ DEFAULT_USERS = {
 }
 
 DEFAULT_ATTENDANCE = {}
+DEFAULT_TASKS = []
 
 
 # ==================== ЗАГРУЗКА ДАННЫХ ====================
 users = load_data("users", DEFAULT_USERS)
 students = load_data("students", DEFAULT_STUDENTS)
 attendance = load_data("attendance", DEFAULT_ATTENDANCE)
+tasks = load_data("tasks", DEFAULT_TASKS)
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -418,11 +436,9 @@ else:
 
             st.divider()
 
-            # ==================== ОТЧЁТ ЗА НЕДЕЛЮ ====================
             st.subheader("📊 Отчёт за неделю (в формате шаблона)")
             st.caption(
                 "Создаёт лист **«Посещаемость»** в Google Таблице. "
-                "Структура — точно как в шаблоне: 6 дней × 3 пары; "
                 "1 пара = 2 акад. часа; **Н** и **Б** дают +2 часа каждый, **О** — опоздание."
             )
 
@@ -453,8 +469,216 @@ else:
 
     # ==================== ЗАДАЧИ ====================
     with tab2:
-        st.write("Раздел задач (заглушка)")
-        st.json(load_data("tasks", {}))
+        st.subheader("📝 Домашние задания")
+
+        # ----- Форма добавления (только для staff) -----
+        if is_staff:
+            with st.expander("➕ Добавить новое задание", expanded=False):
+                with st.form("add_task_form", clear_on_submit=True):
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        new_title = st.text_input("Название задания *", placeholder="Например: Лабораторная №3")
+                    with c2:
+                        new_subject = st.text_input("Предмет", placeholder="Например: Программирование")
+
+                    c3, c4 = st.columns([1, 1])
+                    with c3:
+                        new_deadline = st.date_input("Дедлайн", value=date.today() + timedelta(days=7))
+                    with c4:
+                        new_priority = st.selectbox("Приоритет", PRIORITY_OPTIONS, index=1)
+
+                    new_desc = st.text_area(
+                        "Описание / что сдать",
+                        placeholder="Например: отчёт + код на проверку",
+                        height=80,
+                    )
+
+                    submitted = st.form_submit_button("✅ Добавить задание", type="primary")
+
+                    if submitted:
+                        if not new_title.strip():
+                            st.error("Название задания не может быть пустым.")
+                        else:
+                            tasks = add_task(
+                                tasks,
+                                title=new_title,
+                                subject=new_subject,
+                                deadline=new_deadline,
+                                description=new_desc,
+                                priority=new_priority,
+                            )
+                            save_data("tasks", tasks)
+                            st.success(f"✅ Задание «{new_title}» добавлено.")
+                            st.rerun()
+
+        # ----- Фильтры -----
+        if tasks:
+            fcol1, fcol2, fcol3 = st.columns([1, 1, 2])
+            with fcol1:
+                filter_status = st.selectbox(
+                    "Статус",
+                    ["Все", "Активные", "Выполненные"],
+                    index=0,
+                )
+            with fcol2:
+                subjects_list = sorted({t.get("subject", "") for t in tasks if t.get("subject")})
+                filter_subject = st.selectbox(
+                    "Предмет", ["Все"] + subjects_list, index=0,
+                )
+            with fcol3:
+                sort_mode = st.radio(
+                    "Сортировка",
+                    ["По дедлайну", "По приоритету", "По дате создания"],
+                    horizontal=True,
+                )
+
+            # Применяем фильтры
+            filtered = tasks
+            if filter_status == "Активные":
+                filtered = [t for t in filtered if not t.get("done")]
+            elif filter_status == "Выполненные":
+                filtered = [t for t in filtered if t.get("done")]
+            if filter_subject != "Все":
+                filtered = [t for t in filtered if t.get("subject") == filter_subject]
+
+            # Приоритеты для сортировки: Высокий = 0, Средний = 1, Низкий = 2
+            prio_order = {p: i for i, p in enumerate(PRIORITY_OPTIONS)}
+
+            if sort_mode == "По дедлайну":
+                filtered = sorted(
+                    filtered,
+                    key=lambda t: (t.get("done", False), parse_date(t.get("deadline")) or date.max),
+                )
+            elif sort_mode == "По приоритету":
+                filtered = sorted(
+                    filtered,
+                    key=lambda t: (t.get("done", False), prio_order.get(t.get("priority", ""), 99)),
+                )
+            else:  # По дате создания
+                filtered = sorted(
+                    filtered,
+                    key=lambda t: (t.get("done", False), t.get("created_at", "")),
+                    reverse=False,
+                )
+
+            # ----- Сводка -----
+            total = len(tasks)
+            done_cnt = sum(1 for t in tasks if t.get("done"))
+            active_cnt = total - done_cnt
+            overdue_cnt = 0
+            today_d = date.today()
+            for t in tasks:
+                if t.get("done"):
+                    continue
+                d = parse_date(t.get("deadline"))
+                if d and d < today_d:
+                    overdue_cnt += 1
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Всего", total)
+            m2.metric("Активные", active_cnt)
+            m3.metric("Выполнено", done_cnt)
+            m4.metric("Просрочено", overdue_cnt)
+
+            st.divider()
+
+            # ----- Список заданий -----
+            if not filtered:
+                st.info("По выбранным фильтрам ничего не найдено.")
+            else:
+                today_d = date.today()
+                for t in filtered:
+                    tid = t.get("id", "")
+                    is_done = t.get("done", False)
+                    deadline_d = parse_date(t.get("deadline"))
+                    is_overdue = (not is_done) and deadline_d and deadline_d < today_d
+                    is_today = (not is_done) and deadline_d and deadline_d == today_d
+
+                    # Заголовок
+                    title_icon = "✅" if is_done else "📌"
+                    header = f"{title_icon} **{t.get('title', '—')}**"
+                    if t.get("subject"):
+                        header += f"  ·  *{t['subject']}*"
+
+                    with st.container(border=True):
+                        c1, c2 = st.columns([5, 2])
+
+                        with c1:
+                            st.markdown(header)
+
+                            # Дедлайн и приоритет
+                            meta_parts = []
+                            if t.get("deadline"):
+                                dl_txt = f"📅 Дедлайн: **{t['deadline']}**"
+                                if is_overdue:
+                                    dl_txt += "  🔴 *просрочено*"
+                                elif is_today:
+                                    dl_txt += "  🟠 *сегодня*"
+                                meta_parts.append(dl_txt)
+                            if t.get("priority"):
+                                meta_parts.append(f"⚡ {t['priority']}")
+                            if t.get("created_at"):
+                                meta_parts.append(f"🕓 создано {t['created_at']}")
+                            if meta_parts:
+                                st.markdown("  ·  ".join(meta_parts))
+
+                            if t.get("description"):
+                                st.caption(t["description"])
+
+                            status_badge = "✅ Выполнено" if is_done else "⏳ В работе"
+                            st.markdown(f"**Статус:** {status_badge}")
+
+                        with c2:
+                            if is_staff:
+                                # Отметить выполнено / вернуть в работу
+                                if st.button(
+                                    "↩️ Вернуть" if is_done else "✅ Выполнено",
+                                    key=f"toggle_{tid}",
+                                    use_container_width=True,
+                                ):
+                                    tasks = toggle_task(tasks, tid)
+                                    save_data("tasks", tasks)
+                                    st.rerun()
+
+                                # Редактирование
+                                with st.popover("✏️ Редактировать"):
+                                    ed_title = st.text_input("Название", value=t.get("title", ""), key=f"ed_t_{tid}")
+                                    ed_subj = st.text_input("Предмет", value=t.get("subject", ""), key=f"ed_s_{tid}")
+                                    default_deadline = parse_date(t.get("deadline")) or date.today()
+                                    ed_deadline = st.date_input("Дедлайн", value=default_deadline, key=f"ed_d_{tid}")
+                                    ed_priority = st.selectbox(
+                                        "Приоритет",
+                                        PRIORITY_OPTIONS,
+                                        index=prio_order.get(t.get("priority", ""), 1),
+                                        key=f"ed_p_{tid}",
+                                    )
+                                    ed_desc = st.text_area("Описание", value=t.get("description", ""), key=f"ed_desc_{tid}")
+
+                                    if st.button("💾 Сохранить", key=f"save_{tid}", type="primary"):
+                                        tasks = update_task(
+                                            tasks, tid,
+                                            title=ed_title.strip(),
+                                            subject=ed_subj.strip(),
+                                            deadline=str(ed_deadline),
+                                            priority=ed_priority,
+                                            description=ed_desc.strip(),
+                                        )
+                                        save_data("tasks", tasks)
+                                        st.success("Изменения сохранены.")
+                                        st.rerun()
+
+                                if st.button("🗑 Удалить", key=f"del_{tid}", use_container_width=True):
+                                    tasks = delete_task(tasks, tid)
+                                    save_data("tasks", tasks)
+                                    st.success("Задание удалено.")
+                                    st.rerun()
+                            else:
+                                # Студент — только чтение
+                                st.caption("Просмотр")
+        else:
+            st.info("📭 Пока нет ни одного задания. Староста может добавить его через форму выше."
+                    if is_staff else
+                    "📭 Пока нет ни одного задания.")
 
     # ==================== СТУДЕНТЫ ====================
     with tab3:
