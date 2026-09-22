@@ -19,6 +19,33 @@ STATUS_OPTIONS = ["", "П", "Н", "Б", "О"]
 
 TOTAL_COLS = 2 + len(WEEK_DAYS) * len(SUB_COLS) + 5  # = 25
 
+# ==================== СПИСОК ПРЕДМЕТОВ ====================
+SUBJECTS = [
+    "Английский язык",
+    "Биология",
+    "География",
+    "Индивидуальный проект",
+    "Иностранный язык",
+    "Информатика",
+    "История",
+    "Литература",
+    "Математика",
+    "Обществознание",
+    "Основы безопасности и защиты Родины",
+    "Русский язык",
+    "Физика",
+    "Физическая культура",
+    "Химия",
+    "Основы анализа и визуализации данных",
+    "Основы применения искусственного интеллекта",
+    "Основы проектного менеджмента",
+    "Основы цифровых процессов",
+    "Основы эксплуатации и сопровождения",
+    "Практическая подготовка",
+]
+
+PRIORITY_OPTIONS = ["🔴 Высокий", "🟡 Средний", "🟢 Низкий"]
+
 
 # ==================== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ====================
 USE_DB = False
@@ -124,7 +151,7 @@ def col_letter(n):
 
 
 def parse_date(s):
-    """Аккуратно парсит дату из строки; возвращает date или None."""
+    """Аккуратно парсит дату; возвращает date или None."""
     if not s:
         return None
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
@@ -148,27 +175,6 @@ def add_task(tasks, title, subject, deadline, description, priority):
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
     return tasks
-
-
-def delete_task(tasks, task_id):
-    return [t for t in tasks if t.get("id") != task_id]
-
-
-def toggle_task(tasks, task_id):
-    for t in tasks:
-        if t.get("id") == task_id:
-            t["done"] = not t.get("done", False)
-    return tasks
-
-
-def update_task(tasks, task_id, **fields):
-    for t in tasks:
-        if t.get("id") == task_id:
-            t.update(fields)
-    return tasks
-
-
-PRIORITY_OPTIONS = ["🔴 Высокий", "🟡 Средний", "🟢 Низкий"]
 
 
 # ==================== ЭКСПОРТ ОТЧЁТА ЗА НЕДЕЛЮ ====================
@@ -324,6 +330,9 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.user = None
 
+if "add_task_subject" not in st.session_state:
+    st.session_state.add_task_subject = None
+
 
 # ==================== АВТОРИЗАЦИЯ ====================
 if not st.session_state.logged_in:
@@ -337,6 +346,7 @@ if not st.session_state.logged_in:
             st.rerun()
         else:
             st.error("Неверный логин или пароль")
+
 else:
     user = st.session_state.user
     role = user["role"]
@@ -349,15 +359,21 @@ else:
         st.session_state.user = None
         st.rerun()
 
-    st.title("Панель управления посещаемостью (ИС-116)")
+    st.title("Панель группы ИС-116")
 
-    tab1, tab2, tab3 = st.tabs(["📋 Посещаемость", "📝 Задачи", "👥 Студенты"])
+    # ====== ВКЛАДКИ: у staff — 3, у студента — только «Домашка» ======
+    if is_staff:
+        tab_attendance, tab_tasks, tab_students = st.tabs(
+            ["📋 Посещаемость", "📝 Домашние задания", "👥 Студенты"]
+        )
+    else:
+        tab_tasks, = st.tabs(["📝 Домашние задания"])
+        tab_attendance = None
+        tab_students = None
 
-    # ==================== ПОСЕЩАЕМОСТЬ ====================
-    with tab1:
-        if not is_staff:
-            st.warning("Отмечать посещаемость могут только староста, зам. старосты и куратор.")
-        else:
+    # ==================== ПОСЕЩАЕМОСТЬ (только staff) ====================
+    if tab_attendance is not None:
+        with tab_attendance:
             st.subheader("Журнал посещаемости")
 
             col_d, col_w = st.columns([2, 3])
@@ -374,7 +390,6 @@ else:
                 attendance[date_str] = {
                     name: {sub: "" for sub in SUB_COLS} for name in students
                 }
-
             for name in students:
                 if name not in attendance[date_str]:
                     attendance[date_str][name] = {sub: "" for sub in SUB_COLS}
@@ -396,7 +411,6 @@ else:
                 editor_rows.append(row)
 
             df_editor = pd.DataFrame(editor_rows)
-
             column_config = {
                 "ФИО": st.column_config.TextColumn("ФИО", disabled=True, width="large"),
             }
@@ -435,7 +449,6 @@ else:
                     st.rerun()
 
             st.divider()
-
             st.subheader("📊 Отчёт за неделю (в формате шаблона)")
             st.caption(
                 "Создаёт лист **«Посещаемость»** в Google Таблице. "
@@ -467,223 +480,205 @@ else:
                         except Exception as e:
                             st.error(f"Ошибка при экспорте: {e}")
 
-    # ==================== ЗАДАЧИ ====================
-    with tab2:
+    # ==================== ДОМАШНИЕ ЗАДАНИЯ (всем, редактирование — staff) ====================
+    with tab_tasks:
         st.subheader("📝 Домашние задания")
+        if not is_staff:
+            st.caption("Здесь вы видите список домашних заданий по предметам.")
 
-        # ----- Форма добавления (только для staff) -----
-        if is_staff:
-            with st.expander("➕ Добавить новое задание", expanded=False):
-                with st.form("add_task_form", clear_on_submit=True):
-                    c1, c2 = st.columns([2, 1])
-                    with c1:
-                        new_title = st.text_input("Название задания *", placeholder="Например: Лабораторная №3")
-                    with c2:
-                        new_subject = st.text_input("Предмет", placeholder="Например: Программирование")
+        # --- Метрики ---
+        today_d = date.today()
+        total = len(tasks)
+        done_cnt = sum(1 for t in tasks if t.get("done"))
+        active_cnt = total - done_cnt
+        overdue_cnt = 0
+        for t in tasks:
+            if t.get("done"):
+                continue
+            d = parse_date(t.get("deadline"))
+            if d and d < today_d:
+                overdue_cnt += 1
 
-                    c3, c4 = st.columns([1, 1])
-                    with c3:
-                        new_deadline = st.date_input("Дедлайн", value=date.today() + timedelta(days=7))
-                    with c4:
-                        new_priority = st.selectbox("Приоритет", PRIORITY_OPTIONS, index=1)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Всего", total)
+        m2.metric("Активные", active_cnt)
+        m3.metric("Выполнено", done_cnt)
+        m4.metric("Просрочено", overdue_cnt)
 
-                    new_desc = st.text_area(
-                        "Описание / что сдать",
-                        placeholder="Например: отчёт + код на проверку",
-                        height=80,
+        # --- Фильтры ---
+        fcol1, fcol2 = st.columns([1, 2])
+        with fcol1:
+            filter_status = st.selectbox(
+                "Статус", ["Активные", "Все", "Выполненные"], index=0,
+            )
+        with fcol2:
+            search = st.text_input(
+                "🔍 Поиск по названию", placeholder="Введите часть названия...",
+            )
+
+        def _matches(t):
+            if filter_status == "Активные" and t.get("done"):
+                return False
+            if filter_status == "Выполненные" and not t.get("done"):
+                return False
+            if search and search.strip().lower() not in t.get("title", "").lower():
+                return False
+            return True
+
+        st.divider()
+
+        # --- Группировка по предметам ---
+        tasks_by_subject = {s: [] for s in SUBJECTS}
+        other_tasks = []
+        for t in tasks:
+            s = (t.get("subject") or "").strip()
+            if s in tasks_by_subject:
+                tasks_by_subject[s].append(t)
+            else:
+                other_tasks.append(t)
+
+        def _render_task(t, key_prefix):
+            tid = t.get("id", "")
+            is_done = t.get("done", False)
+            deadline_d = parse_date(t.get("deadline"))
+            is_overdue = (not is_done) and deadline_d and deadline_d < today_d
+            is_today = (not is_done) and deadline_d and deadline_d == today_d
+
+            with st.container(border=True):
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    icon = "✅" if is_done else "📌"
+                    st.markdown(f"{icon} **{t.get('title', '—')}**")
+                    meta = []
+                    if t.get("deadline"):
+                        dl = f"📅 {t['deadline']}"
+                        if is_overdue:
+                            dl += "  🔴 *просрочено*"
+                        elif is_today:
+                            dl += "  🟠 *сегодня*"
+                        meta.append(dl)
+                    if t.get("priority"):
+                        meta.append(f"⚡ {t['priority']}")
+                    if t.get("created_at"):
+                        meta.append(f"🕓 {t['created_at']}")
+                    if meta:
+                        st.caption("  ·  ".join(meta))
+                    if t.get("description"):
+                        st.write(t["description"])
+                    st.markdown(
+                        f"**Статус:** {'✅ Выполнено' if is_done else '⏳ В работе'}"
                     )
-
-                    submitted = st.form_submit_button("✅ Добавить задание", type="primary")
-
-                    if submitted:
-                        if not new_title.strip():
-                            st.error("Название задания не может быть пустым.")
-                        else:
-                            tasks = add_task(
-                                tasks,
-                                title=new_title,
-                                subject=new_subject,
-                                deadline=new_deadline,
-                                description=new_desc,
-                                priority=new_priority,
-                            )
+                with c2:
+                    if is_staff:
+                        if st.button(
+                            "↩️" if is_done else "✅",
+                            key=f"{key_prefix}_toggle_{tid}",
+                            help="Переключить статус",
+                            use_container_width=True,
+                        ):
+                            for x in tasks:
+                                if x.get("id") == tid:
+                                    x["done"] = not x.get("done", False)
                             save_data("tasks", tasks)
-                            st.success(f"✅ Задание «{new_title}» добавлено.")
+                            st.rerun()
+                        if st.button(
+                            "🗑",
+                            key=f"{key_prefix}_del_{tid}",
+                            help="Удалить задание",
+                            use_container_width=True,
+                        ):
+                            tasks[:] = [x for x in tasks if x.get("id") != tid]
+                            save_data("tasks", tasks)
                             st.rerun()
 
-        # ----- Фильтры -----
-        if tasks:
-            fcol1, fcol2, fcol3 = st.columns([1, 1, 2])
-            with fcol1:
-                filter_status = st.selectbox(
-                    "Статус",
-                    ["Все", "Активные", "Выполненные"],
-                    index=0,
-                )
-            with fcol2:
-                subjects_list = sorted({t.get("subject", "") for t in tasks if t.get("subject")})
-                filter_subject = st.selectbox(
-                    "Предмет", ["Все"] + subjects_list, index=0,
-                )
-            with fcol3:
-                sort_mode = st.radio(
-                    "Сортировка",
-                    ["По дедлайну", "По приоритету", "По дате создания"],
-                    horizontal=True,
-                )
+        # --- Рендер по каждому предмету ---
+        for s_idx, subj in enumerate(SUBJECTS):
+            subj_all = tasks_by_subject[subj]
+            subj_filtered = [t for t in subj_all if _matches(t)]
+            subj_active = sum(1 for t in subj_all if not t.get("done"))
 
-            # Применяем фильтры
-            filtered = tasks
-            if filter_status == "Активные":
-                filtered = [t for t in filtered if not t.get("done")]
-            elif filter_status == "Выполненные":
-                filtered = [t for t in filtered if t.get("done")]
-            if filter_subject != "Все":
-                filtered = [t for t in filtered if t.get("subject") == filter_subject]
+            h1, h2 = st.columns([9, 1])
+            with h1:
+                badge = f"  ·  **{subj_active}** в работе" if subj_active else ""
+                st.markdown(f"#### 📚 {subj}{badge}")
+            with h2:
+                if is_staff:
+                    if st.button(
+                        "➕",
+                        key=f"add_btn_{s_idx}",
+                        help="Добавить ДЗ по этому предмету",
+                        use_container_width=True,
+                    ):
+                        st.session_state.add_task_subject = subj
 
-            # Приоритеты для сортировки: Высокий = 0, Средний = 1, Низкий = 2
-            prio_order = {p: i for i, p in enumerate(PRIORITY_OPTIONS)}
+            # Форма добавления (если открыта для этого предмета)
+            if is_staff and st.session_state.add_task_subject == subj:
+                with st.form(f"add_form_{s_idx}", clear_on_submit=True):
+                    st.markdown(f"**Новое задание — «{subj}»**")
+                    t_title = st.text_input(
+                        "Название задания *", placeholder="Например: Лабораторная №3",
+                    )
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        t_deadline = st.date_input(
+                            "Дедлайн", value=date.today() + timedelta(days=7),
+                        )
+                    with cc2:
+                        t_priority = st.selectbox(
+                            "Приоритет", PRIORITY_OPTIONS, index=1,
+                        )
+                    t_desc = st.text_area(
+                        "Описание / что сдать", placeholder="Например: отчёт + код",
+                        height=80,
+                    )
+                    cs, cx = st.columns(2)
+                    with cs:
+                        submitted = st.form_submit_button(
+                            "✅ Добавить", type="primary", use_container_width=True,
+                        )
+                    with cx:
+                        cancelled = st.form_submit_button(
+                            "Отмена", use_container_width=True,
+                        )
 
-            if sort_mode == "По дедлайну":
-                filtered = sorted(
-                    filtered,
-                    key=lambda t: (t.get("done", False), parse_date(t.get("deadline")) or date.max),
-                )
-            elif sort_mode == "По приоритету":
-                filtered = sorted(
-                    filtered,
-                    key=lambda t: (t.get("done", False), prio_order.get(t.get("priority", ""), 99)),
-                )
-            else:  # По дате создания
-                filtered = sorted(
-                    filtered,
-                    key=lambda t: (t.get("done", False), t.get("created_at", "")),
-                    reverse=False,
-                )
+                    if submitted:
+                        if not t_title.strip():
+                            st.error("Название не может быть пустым.")
+                        else:
+                            tasks = add_task(
+                                tasks, t_title, subj, t_deadline, t_desc, t_priority,
+                            )
+                            save_data("tasks", tasks)
+                            st.session_state.add_task_subject = None
+                            st.success(f"✅ Задание добавлено в «{subj}»")
+                            st.rerun()
+                    if cancelled:
+                        st.session_state.add_task_subject = None
+                        st.rerun()
 
-            # ----- Сводка -----
-            total = len(tasks)
-            done_cnt = sum(1 for t in tasks if t.get("done"))
-            active_cnt = total - done_cnt
-            overdue_cnt = 0
-            today_d = date.today()
-            for t in tasks:
-                if t.get("done"):
-                    continue
-                d = parse_date(t.get("deadline"))
-                if d and d < today_d:
-                    overdue_cnt += 1
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Всего", total)
-            m2.metric("Активные", active_cnt)
-            m3.metric("Выполнено", done_cnt)
-            m4.metric("Просрочено", overdue_cnt)
+            # Список заданий
+            if not subj_all:
+                st.caption("— пока нет заданий —")
+            elif not subj_filtered:
+                st.caption("По текущему фильтру ничего не найдено.")
+            else:
+                for t in subj_filtered:
+                    _render_task(t, key_prefix=f"subj{s_idx}")
 
             st.divider()
 
-            # ----- Список заданий -----
-            if not filtered:
-                st.info("По выбранным фильтрам ничего не найдено.")
-            else:
-                today_d = date.today()
-                for t in filtered:
-                    tid = t.get("id", "")
-                    is_done = t.get("done", False)
-                    deadline_d = parse_date(t.get("deadline"))
-                    is_overdue = (not is_done) and deadline_d and deadline_d < today_d
-                    is_today = (not is_done) and deadline_d and deadline_d == today_d
+        # --- Прочие задания ---
+        if other_tasks:
+            with st.expander("📦 Задания без предмета / прочее"):
+                for t in other_tasks:
+                    if _matches(t):
+                        _render_task(t, key_prefix="other")
 
-                    # Заголовок
-                    title_icon = "✅" if is_done else "📌"
-                    header = f"{title_icon} **{t.get('title', '—')}**"
-                    if t.get("subject"):
-                        header += f"  ·  *{t['subject']}*"
-
-                    with st.container(border=True):
-                        c1, c2 = st.columns([5, 2])
-
-                        with c1:
-                            st.markdown(header)
-
-                            # Дедлайн и приоритет
-                            meta_parts = []
-                            if t.get("deadline"):
-                                dl_txt = f"📅 Дедлайн: **{t['deadline']}**"
-                                if is_overdue:
-                                    dl_txt += "  🔴 *просрочено*"
-                                elif is_today:
-                                    dl_txt += "  🟠 *сегодня*"
-                                meta_parts.append(dl_txt)
-                            if t.get("priority"):
-                                meta_parts.append(f"⚡ {t['priority']}")
-                            if t.get("created_at"):
-                                meta_parts.append(f"🕓 создано {t['created_at']}")
-                            if meta_parts:
-                                st.markdown("  ·  ".join(meta_parts))
-
-                            if t.get("description"):
-                                st.caption(t["description"])
-
-                            status_badge = "✅ Выполнено" if is_done else "⏳ В работе"
-                            st.markdown(f"**Статус:** {status_badge}")
-
-                        with c2:
-                            if is_staff:
-                                # Отметить выполнено / вернуть в работу
-                                if st.button(
-                                    "↩️ Вернуть" if is_done else "✅ Выполнено",
-                                    key=f"toggle_{tid}",
-                                    use_container_width=True,
-                                ):
-                                    tasks = toggle_task(tasks, tid)
-                                    save_data("tasks", tasks)
-                                    st.rerun()
-
-                                # Редактирование
-                                with st.popover("✏️ Редактировать"):
-                                    ed_title = st.text_input("Название", value=t.get("title", ""), key=f"ed_t_{tid}")
-                                    ed_subj = st.text_input("Предмет", value=t.get("subject", ""), key=f"ed_s_{tid}")
-                                    default_deadline = parse_date(t.get("deadline")) or date.today()
-                                    ed_deadline = st.date_input("Дедлайн", value=default_deadline, key=f"ed_d_{tid}")
-                                    ed_priority = st.selectbox(
-                                        "Приоритет",
-                                        PRIORITY_OPTIONS,
-                                        index=prio_order.get(t.get("priority", ""), 1),
-                                        key=f"ed_p_{tid}",
-                                    )
-                                    ed_desc = st.text_area("Описание", value=t.get("description", ""), key=f"ed_desc_{tid}")
-
-                                    if st.button("💾 Сохранить", key=f"save_{tid}", type="primary"):
-                                        tasks = update_task(
-                                            tasks, tid,
-                                            title=ed_title.strip(),
-                                            subject=ed_subj.strip(),
-                                            deadline=str(ed_deadline),
-                                            priority=ed_priority,
-                                            description=ed_desc.strip(),
-                                        )
-                                        save_data("tasks", tasks)
-                                        st.success("Изменения сохранены.")
-                                        st.rerun()
-
-                                if st.button("🗑 Удалить", key=f"del_{tid}", use_container_width=True):
-                                    tasks = delete_task(tasks, tid)
-                                    save_data("tasks", tasks)
-                                    st.success("Задание удалено.")
-                                    st.rerun()
-                            else:
-                                # Студент — только чтение
-                                st.caption("Просмотр")
-        else:
-            st.info("📭 Пока нет ни одного задания. Староста может добавить его через форму выше."
-                    if is_staff else
-                    "📭 Пока нет ни одного задания.")
-
-    # ==================== СТУДЕНТЫ ====================
-    with tab3:
-        st.write("Управление списком студентов")
-        st.json(students)
-        if st.button("Сбросить список студентов на дефолтный"):
-            save_data("students", DEFAULT_STUDENTS)
-            st.rerun() 
+    # ==================== СТУДЕНТЫ (только staff) ====================
+    if tab_students is not None:
+        with tab_students:
+            st.write("Управление списком студентов")
+            st.json(students)
+            if st.button("Сбросить список студентов на дефолтный"):
+                save_data("students", DEFAULT_STUDENTS)
+                st.rerun() 
