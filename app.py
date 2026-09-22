@@ -33,7 +33,7 @@ ROLE_PERMISSIONS = {
         "can_edit_notes": True,
         "can_export": True,
         "can_view_tasks": True,
-        "can_change_password": True  # Только админы могут менять пароль
+        "can_change_password": True
     },
     "zam": {
         "can_manage_students": True,
@@ -73,9 +73,12 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, stored_hash: str) -> bool:
     if "\$" in stored_hash:
-        salt, h = stored_hash.split("\$", 1)
-        computed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
-        return computed.hex() == h
+        try:
+            salt, h = stored_hash.split("\$", 1)
+            computed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+            return computed.hex() == h
+        except Exception:
+            return False
     return hashlib.sha256(password.encode("utf-8")).hexdigest() == stored_hash
 
 
@@ -161,75 +164,90 @@ DEFAULT_STUDENTS = [
     "Середа Егор"
 ]
 
-# ==================== ЭКСПОРТ В GOOGLE SHEETS ====================
+# ==================== ЭКСПОРТ В GOOGLE SHEETS (ИСПРАВЛЕННЫЙ) ====================
 def export_to_google_sheets(spreadsheet_id, students, attendance, tasks):
     try:
         import gspread
         from google.oauth2.service_account import Credentials
         import json
-        import os
-    except ImportError:
-        raise RuntimeError("Установите библиотеки: pip install gspread google-auth")
+        
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+        creds_content = os.environ.get("CREDS_JSON")
+        
+        if not creds_content:
+            if os.path.exists(CREDS_FILE):
+                with open(CREDS_FILE, "r", encoding="utf-8") as f:
+                    creds_data = json.load(f)
+            else:
+                raise FileNotFoundError("Не найден ключ доступа. Проверьте Secrets в Streamlit Cloud.")
+        else:
+            try:
+                creds_data = json.loads(creds_content)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Ошибка формата ключа в Secrets: {e}")
 
-    creds_content = os.environ.get("CREDS_JSON")
-    
-    if creds_content:
-        creds_data = json.loads(creds_content)
-    else:
-        if not os.path.exists(CREDS_FILE):
-            raise FileNotFoundError("Не найден файл credentials.json и нет переменной CREDS_JSON")
-        with open(CREDS_FILE, "r", encoding="utf-8") as f:
-            creds_data = json.load(f)
+        creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
+        client = gspread.authorize(creds)
+        
+        try:
+            sheet = client.open_by_key(spreadsheet_id)
+        except gspread.exceptions.SpreadsheetNotFound:
+            raise FileNotFoundError(f"Таблица с ID '{spreadsheet_id}' не найдена. Проверьте ID и права доступа.")
+        except gspread.exceptions.APIError as e:
+            raise PermissionError(f"Нет доступа к таблице. Добавьте email сервисного аккаунта в настройки доступа таблицы как 'Редактор'. Детали: {e}")
 
-    creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(spreadsheet_id)
+        # --- Студенты ---
+        try:
+            ws = sheet.worksheet("Студенты")
+            ws.clear()
+        except gspread.WorksheetNotFound:
+            ws = sheet.add_worksheet(title="Студенты", rows=200, cols=5)
+        
+        ws.update("A1", [["№", "ФИО"]])
+        if students:
+            data_students = [[i, s] for i, s in enumerate(students, 1)]
+            ws.update(f"A2:B{len(students)+1}", data_students)
 
-    # --- Студенты ---
-    try:
-        ws = sheet.worksheet("Студенты")
-        ws.clear()
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title="Студенты", rows=200, cols=5)
-    ws.update("A1", [["№", "ФИО"]])
-    if students:
-        ws.update(f"A2:B{len(students)+1}",
-                  [[i, s] for i, s in enumerate(students, 1)])
+        # --- Посещаемость ---
+        last_col = col_letter(max(len(students) + 1, 2))
+        try:
+            ws2 = sheet.worksheet("Посещаемость")
+            ws2.clear()
+        except gspread.WorksheetNotFound:
+            ws2 = sheet.add_worksheet(title="Посещаемость", rows=500, cols=max(len(students) + 2, 5))
+        
+        ws2.update("A1", [["Дата"] + students])
+        
+        if attendance:
+            rows = []
+            for date in sorted(attendance.keys()):
+                day_data = attendance[date]
+                row = [date] + ["✓" if day_data.get(s, True) else "✗" for s in students]
+                rows.append(row)
+            
+            if rows:
+                ws2.update(f"A2:{last_col}{len(rows)+1}", rows)
 
-    # --- Посещаемость ---
-    last_col = col_letter(max(len(students) + 1, 2))
-    try:
-        ws2 = sheet.worksheet("Посещаемость")
-        ws2.clear()
-    except gspread.WorksheetNotFound:
-        ws2 = sheet.add_worksheet(title="Посещаемость", rows=500,
-                                   cols=max(len(students) + 2, 5))
-    ws2.update("A1", [["Дата"] + students])
-    if attendance:
-        rows = []
-        for date, day_data in sorted(attendance.items()):
-            rows.append([date] + ["✓" if day_data.get(s, True) else "✗"
-                                  for s in students])
-        ws2.update(f"A2:{last_col}{len(rows)+1}", rows)
+        # --- Задания ---
+        try:
+            ws3 = sheet.worksheet("Задания")
+            ws3.clear()
+        except gspread.WorksheetNotFound:
+            ws3 = sheet.add_worksheet(title="Задания", rows=200, cols=4)
+        
+        ws3.update("A1", [["Задание", "Дедлайн", "Статус"]])
+        if tasks:
+            rows_tasks = [[t["title"], t["deadline"], "Выполнено" if t["done"] else "В работе"] for t in tasks]
+            ws3.update(f"A2:C{len(rows_tasks)+1}", rows_tasks)
 
-    # --- Задания ---
-    try:
-        ws3 = sheet.worksheet("Задания")
-        ws3.clear()
-    except gspread.WorksheetNotFound:
-        ws3 = sheet.add_worksheet(title="Задания", rows=200, cols=4)
-    ws3.update("A1", [["Задание", "Дедлайн", "Статус"]])
-    if tasks:
-        rows = [[t["title"], t["deadline"],
-                 "Выполнено" if t["done"] else "В работе"] for t in tasks]
-        ws3.update(f"A2:C{len(rows)+1}", rows)
+        return f"✅ Успешно! Ссылка: https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
-    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    except Exception as e:
+        return f"❌ Ошибка экспорта: {str(e)}"
 
 
 # ==================== СЕССИЯ ====================
@@ -310,7 +328,6 @@ def main_app():
         if can_view_tasks and "📝 Задания" not in menu_options:
             menu_options.append("📝 Задания")
         
-        # Кнопка смены пароля только если разрешено
         if can_change_password:
             menu_options.append("🔑 Сменить пароль")
 
@@ -332,13 +349,15 @@ def main_app():
     if st.session_state.show_export:
         with st.expander("📤 Экспорт в Google Таблицы", expanded=True):
             sid = st.text_input("ID Google Таблицы",
-                                placeholder="из URL между /d/ и /edit")
-            if st.button("Начать экспорт"):
-                try:
-                    url = export_to_google_sheets(sid, students, attendance, tasks)
-                    st.success(f"✅ Готово! Ссылка на таблицу: {url}")
-                except Exception as e:
-                    st.error(f"❌ Ошибка экспорта: {e}")
+                                placeholder="Только ID (между /d/ и /edit)")
+            if st.button("Начать экспорт", type="primary"):
+                with st.spinner("Идёт загрузка данных..."):
+                    result = export_to_google_sheets(sid, students, attendance, tasks)
+                
+                if result.startswith("✅"):
+                    st.success(result)
+                else:
+                    st.error(result)
 
     # --- Логика вкладок ---
     if menu == "👥 Студенты" and is_admin:
