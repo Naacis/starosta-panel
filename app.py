@@ -33,6 +33,7 @@ ROLE_PERMISSIONS = {
         "can_edit_notes": True,
         "can_export": True,
         "can_view_tasks": True,
+        "can_change_password": True  # Только админы могут менять пароль
     },
     "zam": {
         "can_manage_students": True,
@@ -41,6 +42,7 @@ ROLE_PERMISSIONS = {
         "can_edit_notes": True,
         "can_export": True,
         "can_view_tasks": True,
+        "can_change_password": True
     },
     "kurator": {
         "can_manage_students": True,
@@ -49,6 +51,7 @@ ROLE_PERMISSIONS = {
         "can_edit_notes": True,
         "can_export": True,
         "can_view_tasks": True,
+        "can_change_password": True
     },
     "student": {
         "can_manage_students": False,
@@ -57,6 +60,7 @@ ROLE_PERMISSIONS = {
         "can_edit_notes": False,
         "can_export": False,
         "can_view_tasks": True,
+        "can_change_password": False  # Студенты НЕ могут менять пароль
     }
 }
 
@@ -172,13 +176,11 @@ def export_to_google_sheets(spreadsheet_id, students, attendance, tasks):
         "https://www.googleapis.com/auth/drive"
     ]
 
-    # Сначала пробуем взять ключ из Secrets в Streamlit Cloud
     creds_content = os.environ.get("CREDS_JSON")
     
     if creds_content:
         creds_data = json.loads(creds_content)
     else:
-        # Если секрета нет (например, запускаешь локально), пробуем взять из файла
         if not os.path.exists(CREDS_FILE):
             raise FileNotFoundError("Не найден файл credentials.json и нет переменной CREDS_JSON")
         with open(CREDS_FILE, "r", encoding="utf-8") as f:
@@ -273,6 +275,7 @@ def main_app():
     perms = ROLE_PERMISSIONS.get(role, {})
     is_admin = perms.get("can_manage_students", False)
     can_view_tasks = perms.get("can_view_tasks", False)
+    can_change_password = perms.get("can_change_password", False)
 
     # Загрузка данных
     students = load_json(STUDENTS_FILE, [])
@@ -307,7 +310,9 @@ def main_app():
         if can_view_tasks and "📝 Задания" not in menu_options:
             menu_options.append("📝 Задания")
         
-        menu_options.append("🔑 Сменить пароль")
+        # Кнопка смены пароля только если разрешено
+        if can_change_password:
+            menu_options.append("🔑 Сменить пароль")
 
         menu = st.radio("Меню", menu_options)
 
@@ -349,10 +354,8 @@ def main_app():
     elif menu == "📅 Посещаемость" and is_admin:
         st.header("📅 Посещаемость (авто-сетка на 5 дней)")
         
-        # Генерация дат для сетки (5 дней вперед)
         dates = [(datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(5)]
         
-        # Инициализация посещаемости, если пусто
         if not attendance:
             for d in dates:
                 attendance[d] = {s: True for s in students}
@@ -361,10 +364,9 @@ def main_app():
         st.write("Даты для заполнения:")
         st.write(", ".join(dates))
 
-        # Простая форма редактирования (чекбоксы)
         for date in dates:
             st.subheader(date)
-            cols = st.columns(min(len(students), 5)) # Чтобы не было слишком много колонок
+            cols = st.columns(min(len(students), 5))
             for i, student in enumerate(students):
                 if len(cols) > i:
                     default_val = attendance.get(date, {}).get(student, True)
@@ -377,7 +379,6 @@ def main_app():
     elif menu == "📝 Задания":
         st.header("📝 Задания (Домашка)")
         
-        # Форма добавления задания
         with st.form("add_task"):
             title = st.text_input("Название задания")
             deadline = st.date_input("Дедлайн")
@@ -391,7 +392,6 @@ def main_app():
                 save_json(TASKS_FILE, tasks)
                 st.rerun()
 
-        # Отображение списка
         if tasks:
             df_tasks = pd.DataFrame(tasks)
             st.dataframe(df_tasks, use_container_width=True)
@@ -405,7 +405,7 @@ def main_app():
             save_json(NOTES_FILE, notes_text)
             st.success("Заметка сохранена!")
 
-    elif menu == "🔑 Сменить пароль":
+    elif menu == "🔑 Сменить пароль" and can_change_password:
         st.header("🔐 Смена пароля")
         old_pass = st.text_input("Старый пароль", type="password")
         new_pass = st.text_input("Новый пароль", type="password")
@@ -429,8 +429,7 @@ def main_app():
         st.markdown(f"Привет, {user['name']}! Выбери раздел в меню слева.")
         
         if role == "student":
-            st.info("📋 Как студент, вы видите только список заданий (вкладка «Задания»).")
-            # Дублируем логику заданий для быстрого доступа студентам
+            st.info("📋 Как студент, вы видите только список заданий. Смена пароля недоступна.")
             if tasks:
                 st.subheader("Ваша домашка:")
                 for t in tasks:
@@ -445,3 +444,4 @@ if st.session_state.user is None:
     login_screen()
 else:
     main_app()
+ 
