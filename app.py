@@ -4,19 +4,22 @@ import os
 import hashlib
 import secrets
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ==================== НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ ====================
+# ==================== НАСТРОЙКИ ====================
 st.set_page_config(page_title="Панель старосты ИС-116", page_icon="🎓", layout="wide")
 
-# --- КОНФИГУРАЦИЯ ---
 WEEK_DAYS = ["понед", "втор", "среда", "чтв", "пятн", "суб"]
 SUB_COLS = ["1", "2", "3"]
-ATTENDANCE_ROLES = ("starosta", "zam", "kurator")
+HOURS_PER_SUB = 2  # 1 пара = 2 часа
 
-# --- ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS (БАЗА ДАННЫХ) ---
+# ==================== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ====================
+USE_DB = False
+ws_data = None
+sheet = None
+
 try:
     SPREADSHEET_ID = st.secrets["DATA_SPREADSHEET_ID"]
     CREDS_JSON_STR = st.secrets["CREDS_JSON"]
@@ -27,7 +30,6 @@ try:
     client = gspread.authorize(creds)
     sheet = client.open_by_key(SPREADSHEET_ID)
     
-    # Получаем лист для хранения данных (app_data)
     try:
         ws_data = sheet.worksheet("app_data")
     except gspread.exceptions.WorksheetNotFound:
@@ -37,23 +39,11 @@ try:
     USE_DB = True
 except Exception as e:
     st.error(f"❌ Ошибка подключения к БД: {e}")
-    st.info("⚠️ Работа в демо-режиме. Данные сбросятся после перезагрузки страницы.")
-    USE_DB = False
+    st.info("⚠️ Работа в демо-режиме. Данные сбросятся после перезагрузки.")
 
-# Локальные файлы как запасной вариант
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-FILES = {
-    "students": os.path.join(DATA_DIR, "students.json"),
-    "attendance": os.path.join(DATA_DIR, "attendance.json"),
-    "tasks": os.path.join(DATA_DIR, "tasks.json"),
-    "users": os.path.join(DATA_DIR, "users.json")
-}
-
-# ==================== СЛОЙ ХРАНЕНИЯ ДАННЫХ ====================
+# ==================== ФУНКЦИИ ХРАНЕНИЯ ДАННЫХ ====================
 
 def load_data(key, default):
-    """Загружает данные из Google Sheets или локального файла"""
     if USE_DB:
         try:
             cell = ws_data.find(key, in_column=1)
@@ -62,9 +52,11 @@ def load_data(key, default):
                 if val: return json.loads(val)
             return default
         except:
-            pass # Fallback to local
+            pass
     
-    path = FILES.get(key, "")
+    # Fallback на локальные файлы (если нужно для тестов на ПК)
+    path = f"data/{key}.json"
+    os.makedirs("data", exist_ok=True)
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -74,7 +66,6 @@ def load_data(key, default):
     return default
 
 def save_data(key, data):
-    """Сохраняет данные в Google Sheets или локальный файл"""
     json_str = json.dumps(data, ensure_ascii=False)
     if USE_DB:
         try:
@@ -86,17 +77,12 @@ def save_data(key, data):
             return True
         except Exception as e:
             st.warning(f"⚠️ Не удалось сохранить в облако: {e}")
-            # Пробуем сохранить локально даже если облако упало
-            path = FILES.get(key, "")
-            if path:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
             return False
     else:
-        path = FILES.get(key, "")
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        path = f"data/{key}.json"
+        os.makedirs("data", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     return True
 
 # ==================== УТИЛИТЫ ====================
@@ -137,16 +123,15 @@ DEFAULT_USERS = {
     "student_test": {"password": hash_password("student123"), "role": "student", "name": "Студент"}
 }
 
-DEFAULT_ATTENDANCE = {} # Структура: {student_name: {date: {sub: 'H'/'P'}}}
+# Структура attendance: { "YYYY-MM-DD": { "ФИО": { "1": "П", "2": "Н", "3": "" } } }
+DEFAULT_ATTENDANCE = {}
 
 # ==================== ЛОГИКА ПРИЛОЖЕНИЯ ====================
 
-# Загрузка состояния
 users = load_data("users", DEFAULT_USERS)
 students = load_data("students", DEFAULT_STUDENTS)
 attendance = load_data("attendance", DEFAULT_ATTENDANCE)
 
-# Сессия для авторизации
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.user = None
@@ -164,7 +149,6 @@ if not st.session_state.logged_in:
         else:
             st.error("Неверный логин или пароль")
 else:
-    # --- ОСНОВНОЙ ИНТЕРФЕЙС ---
     user = st.session_state.user
     st.sidebar.title(f"Привет, {user['name']}")
     st.sidebar.write(f"Роль: {user['role']}")
@@ -174,7 +158,6 @@ else:
 
     st.title("Панель управления посещаемостью (ИС-116)")
     
-    # Вкладка: Отметка посещаемости
     tab1, tab2, tab3 = st.tabs(["📋 Посещаемость", "📝 Задачи", "👥 Студенты"])
 
     with tab1:
@@ -184,117 +167,122 @@ else:
         selected_date = st.date_input("Выберите дату для отметки", datetime.now())
         date_str = selected_date.strftime("%Y-%m-%d")
         
-        # Инициализация данных за дату, если нет
+        # Инициализация данных за дату
         if date_str not in attendance:
             attendance[date_str] = {name: {sub: "" for sub in SUB_COLS} for name in students}
             save_data("attendance", attendance)
 
-        # Создание DataFrame для отображения (как в вашей таблице)
-        data_rows = 
-        for name in students:
-            row = {"ФИО": name}
-            for day in WEEK_DAYS:
-                # Здесь можно добавить логику группировки по неделям, пока просто фиксируем дату
-                pass 
-            
-            # Для простоты отображения в Streamlit делаем колонки по парам
-            for sub in SUB_COLS:
-                val = attendance[date_str][name].get(sub, "")
-                row[f"{sub} пара"] = val
-            
-            # Колонки причин (упрощенно храним в отдельном словаре или в attendance)
-            # Для соответствия фото: добавим колонки причин
-            row["Уваж. причина"] = "" 
-            row["Неуваж. причина"] = ""
-            data_rows.append(row)
-
-        df = pd.DataFrame(data_rows)
+        # --- ИНТЕРФЕЙС ОТМЕТКИ ПО ПАРАМ ---
+        st.write("### Отметьте посещаемость по парам:")
         
-        # Отображение таблицы для редактирования
-        edited_df = st.dataframe(df, use_container_width=True, hide_index=True)
+        # Группируем студентов по колонкам для компактности
+        cols_per_row = 2
+        num_cols = len(students) // cols_per_row + (1 if len(students) % cols_per_row else 0)
+        cols = st.columns(cols_per_row)
         
-        # Логика сохранения изменений (упрощенная: при нажатии кнопки)
-        if st.button("Сохранить изменения посещаемости"):
-            # Обновляем глобальный словарь attendance на основе edited_df
-            # Примечание: st.dataframe возвращает отредактированный DF только если включен experimental_dataeditor
-            # Для надежности в этом примере мы будем сохранять состояние через st.session_state или просто обновлять при изменении
-            
-            # ВАЖНО: В Streamlit прямое редактирование dataframe не всегда триггерит сохранение автоматически.
-            # Ниже реализация через ручные ячейки (более надежно для начала) или использование session_state.
-            
-            # Для демонстрации структуры "как на фото" я сделаю таблицу ввода вручную, 
-            # так как st.dataframe(editable=True) требует дополнительных настроек для сохранения.
-            pass
-
-        # --- РЕЖИМ РЕДАКТИРОВАНИЯ (РУЧНОЙ ВВОД ДЛЯ НАДЕЖНОСТИ) ---
-        st.divider()
-        st.write("### Быстрый ввод посещаемости (по студентам)")
-        
-        cols = st.columns(3)
         for i, name in enumerate(students):
-            with cols[i % 3]:
+            with cols[i % cols_per_row]:
                 st.write(f"**{name}**")
-                col1, col2, col3 = st.columns(3)
                 for sub in SUB_COLS:
                     current_val = attendance[date_str][name].get(sub, "")
-                    new_val = col1.selectbox(f"Пара {sub}", ["", "П", "Н", "Б"], key=f"{name}_{sub}", index=(["", "П", "Н", "Б"].index(current_val) if current_val in ["", "П", "Н", "Б"] else 0))
+                    # Варианты: П (Присутствовал), Н (Нет), Б (Болен)
+                    new_val = st.selectbox(
+                        f"Пара {sub}", 
+                        ["", "П", "Н", "Б"], 
+                        index=(["", "П", "Н", "Б"].index(current_val) if current_val in ["", "П", "Н", "Б"] else 0),
+                        key=f"{name}_{sub}_{date_str}"
+                    )
                     attendance[date_str][name][sub] = new_val
-                
-                # Причины (текстовые поля)
-                st.text_input("Уваж. причина", key=f"u_{name}")
-                st.text_input("Неуваж. причина", key=f"n_{name}")
-
-        if st.button("💾 ЗАФИКСИРОВАТЬ ВСЕ ИЗМЕНЕНИЯ", type="primary"):
+        
+        if st.button("💾 Сохранить изменения посещаемости", type="primary"):
             save_data("attendance", attendance)
             st.success("Данные сохранены в Google Sheets!")
 
-        # --- ЭКСПОРТ ТОЧНО КАК НА ФОТО ---
         st.divider()
-        st.subheader("Экспорт в Google Таблицу (формат как на фото)")
+
+        # --- ЭКСПОРТ ОТЧЁТА С ПОДСЧЁТОМ ЧАСОВ ---
+        st.subheader("📊 Сформировать отчёт за неделю (с подсчётом часов)")
         
-        if st.button("🚀 Сформировать отчет за неделю"):
-            with st.spinner("Генерация отчета..."):
-                # 1. Создаем структуру DataFrame идентичную вашей картинке
+        if st.button("🚀 Создать отчёт в Google Таблице"):
+            with st.spinner("Генерация отчёта..."):
+                # 1. Определяем диапазон дат (текущая неделя)
+                today = datetime.now()
+                start_of_week = today - timedelta(days=today.weekday()) # Понедельник
+                dates_in_week = [(start_of_week + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+                
                 report_data = 
                 
-                # Заголовки строк (упрощенно берем всех студентов)
                 for idx, name in enumerate(students, 1):
                     row = {
                         "№": idx,
-                        "ФИО студента": name
+                        "ФИО студента": name,
+                        "Всего пропущено часов": 0,
+                        "Уважительные причины": "",
+                        "Неуважительные причины": ""
                     }
+                    
                     # Добавляем колонки для каждой пары каждого дня
-                    # Структура: понед (1,2,3), втор (1,2,3)...
                     for day in WEEK_DAYS:
                         for sub in SUB_COLS:
-                            # Здесь должна быть логика получения данных за конкретную неделю.
-                            # Пока ставим заглушки или берем последнюю дату.
-                            row[f"{day}_{sub}"] = "Н" # Н - нет данных или норма
+                            col_name = f"{day}_{sub}"
+                            row[col_name] = "" # Заглушка, заполним ниже
                     
-                    row["Количество пропусков"] = 0
-                    row["Уважительная причина"] = ""
-                    row["Неуважительная причина"] = ""
+                    # Заполняем данные и считаем часы
+                    missed_hours = 0
+                    reasons_u = 
+                    reasons_n = 
+                    
+                    for d_str in dates_in_week:
+                        if d_str in attendance:
+                            student_data = attendance[d_str].get(name, {})
+                            for sub in SUB_COLS:
+                                status = student_data.get(sub, "")
+                                col_key = f"{WEEK_DAYS[datetime.strptime(d_str, '%Y-%m-%d').weekday()]}_{sub}"
+                                
+                                if status == "Н":
+                                    row[col_key] = "Н"
+                                    missed_hours += HOURS_PER_SUB
+                                    reasons_n.append(f"{d_str} пара {sub}")
+                                elif status == "Б":
+                                    row[col_key] = "Б"
+                                    # Болезнь обычно считается уважительной, но часы тоже теряются
+                                    missed_hours += HOURS_PER_SUB
+                                    reasons_u.append(f"{d_str} пара {sub} (Болен)")
+                                elif status == "П":
+                                    row[col_key] = "П"
+                                else:
+                                    row[col_key] = "-"
+                    
+                    row["Всего пропущено часов"] = missed_hours
+                    row["Уважительные причины"] = "; ".join(reasons_u)
+                    row["Неуважительные причины"] = "; ".join(reasons_n)
+                    
                     report_data.append(row)
 
                 df_report = pd.DataFrame(report_data)
                 
-                # Переименуем колонки, чтобы они выглядели как на фото (без подчеркиваний)
-                # Это нужно для красивого отображения, но при записи в Google Sheets имена колонок не важны, важны позиции.
+                # Переупорядочиваем колонки для красивого вида (как на фото)
+                # Сначала №, ФИО, потом дни недели блоками, потом итоги
+                final_columns = ["№", "ФИО студента"]
+                for day in WEEK_DAYS:
+                    for sub in SUB_COLS:
+                        final_columns.append(f"{day}_{sub}")
+                final_columns.extend(["Всего пропущено часов", "Уважительные причины", "Неуважительные причины"])
                 
+                df_report = df_report[final_columns]
+
                 # 2. Запись в Google Sheets
                 try:
-                    # Создаем новый лист или очищаем старый "Отчет"
                     try:
-                        ws_report = sheet.worksheet("Отчет")
+                        ws_report = sheet.worksheet("Отчет_Неделя")
                         ws_report.clear()
                     except:
-                        ws_report = sheet.add_worksheet(title="Отчет", rows=100, cols=20)
+                        ws_report = sheet.add_worksheet(title="Отчет_Неделя", rows=100, cols=30)
                     
                     # Записываем данные
                     ws_report.update([df_report.columns.values.tolist()] + df_report.values.tolist())
                     
-                    # Форматирование (объединение ячеек как на фото)
-                    # Функция col_letter нужна для адресации
+                    # Форматирование: объединение ячеек дней недели
                     def col_letter(n):
                         result = ""
                         while n > 0:
@@ -302,25 +290,35 @@ else:
                             result = chr(65 + rem) + result
                         return result
 
-                    # Объединяем заголовки дней недели
-                    start_col = 3 # C - начало дней недели
+                    # Заголовки дней недели начинаются с колонки C (индекс 3, т.к. A=1, B=2)
+                    # Но в DataFrame колонки идут подряд. Нужно сопоставить индексы.
+                    # В нашем DF: 0=№, 1=ФИО, 2=понед_1, 3=понед_2, 4=понед_3...
+                    
+                    start_col_idx = 2 # Индекс колонки 'понед_1' в списке колонок
+                    
                     for day in WEEK_DAYS:
-                        end_col = start_col + len(SUB_COLS) - 1
-                        range_str = f"{col_letter(start_col)}1:{col_letter(end_col)}1"
+                        # Вычисляем буквы колонок для объединения
+                        c1 = col_letter(start_col_idx + 1) # +1 т.к. col_letter принимает 1-based индекс
+                        c2 = col_letter(start_col_idx + 3)
+                        range_str = f"{c1}1:{c2}1"
+                        
                         ws_report.merge_cells(range_str)
                         ws_report.update_acell(range_str.split(":"), day)
-                        start_col = end_col + 1
+                        
+                        start_col_idx += 3
                     
-                    # Заголовок "Учебная неделя №"
-                    last_col = 3 + len(WEEK_DAYS) * len(SUB_COLS)
-                    ws_report.merge_cells(f"{col_letter(last_col)}1:{col_letter(last_col)}3")
-                    ws_report.update_acell(f"{col_letter(last_col)}1", "Учебная неделя №")
+                    # Заголовок "Учебная неделя №" (ставим в последнюю колонку перед итогами)
+                    last_data_col = 2 + (len(WEEK_DAYS) * len(SUB_COLS))
+                    last_col_letter = col_letter(last_data_col + 1)
+                    ws_report.merge_cells(f"{last_col_letter}1:{last_col_letter}3")
+                    ws_report.update_acell(f"{last_col_letter}1", "Учебная неделя №")
                     
-                    # Стилизация
-                    ws_report.format("A1:C1", {"textFormat": {"bold": True}})
+                    # Жирный шрифт для заголовков
+                    ws_report.format("A1:ZZ1", {"textFormat": {"bold": True}})
                     
-                    st.success("✅ Отчет создан на листе 'Отчет' в вашей Google Таблице!")
-                    st.info("Откройте таблицу и проверьте лист 'Отчет'. Формат полностью соответствует вашему образцу.")
+                    st.success("✅ Отчёт создан на листе 'Отчет_Неделя'!")
+                    st.info("Откройте Google Таблицу и проверьте лист 'Отчет_Неделя'. Там есть подсчёт часов и причины.")
+                    
                 except Exception as e:
                     st.error(f"Ошибка при экспорте: {e}")
 
