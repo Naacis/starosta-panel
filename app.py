@@ -47,6 +47,31 @@ SUBJECTS = [
 PRIORITY_OPTIONS = ["🔴 Высокий", "🟡 Средний", "🟢 Низкий"]
 
 
+# ==================== ХЕЛПЕРЫ ДЛЯ БЕЗОПАСНОЙ РАБОТЫ С ДАННЫМИ ====================
+def safe_str(v):
+    """Приводит любое значение к строке. NaN/None → ''."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    return str(v)
+
+
+def safe_strip(v):
+    """Как safe_str, но ещё убирает пробелы по краям."""
+    return safe_str(v).strip()
+
+
+def safe_dict(v):
+    """Возвращает dict, если v — словарь. Иначе — пустой dict."""
+    return v if isinstance(v, dict) else {}
+
+
+def safe_list(v):
+    """Возвращает list, если v — список. Иначе — пустой list."""
+    return v if isinstance(v, list) else []
+
+
 # ==================== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ====================
 USE_DB = False
 ws_data = None
@@ -130,6 +155,8 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
+    if not isinstance(stored_hash, str):
+        return False
     if "$" in stored_hash:
         try:
             salt, h = stored_hash.split("$", 1)
@@ -152,11 +179,12 @@ def col_letter(n):
 
 def parse_date(s):
     """Аккуратно парсит дату; возвращает date или None."""
+    s = safe_strip(s)
     if not s:
         return None
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
         try:
-            return datetime.strptime(str(s).strip(), fmt).date()
+            return datetime.strptime(s, fmt).date()
         except Exception:
             continue
     return None
@@ -166,11 +194,11 @@ def parse_date(s):
 def add_task(tasks, title, subject, deadline, description, priority):
     tasks.append({
         "id": secrets.token_hex(6),
-        "title": title.strip(),
-        "subject": subject.strip(),
-        "deadline": str(deadline),
-        "description": description.strip(),
-        "priority": priority,
+        "title": safe_strip(title),
+        "subject": safe_strip(subject),
+        "deadline": safe_strip(str(deadline)),
+        "description": safe_strip(description),
+        "priority": safe_strip(priority),
         "done": False,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
@@ -220,16 +248,20 @@ def export_weekly_report_to_sheet(sheet, week_offset, students, attendance):
     ws.update("A1", [row1, row2, row3])
 
     data_rows = []
-    for idx, name in enumerate(students, 1):
+    for idx, name_raw in enumerate(students, 1):
+        name = safe_strip(name_raw)
         row = [idx, name]
         u_hours = 0
         n_hours = 0
         lates = 0
 
         for d_str in dates_in_week:
-            day_data = attendance.get(d_str, {}).get(name, {}) or {}
+            day_all = safe_dict(attendance.get(d_str, {}))
+            day_data = safe_dict(day_all.get(name, {}))
+
             for sub in SUB_COLS:
-                status = (day_data.get(sub, "") or "").strip()
+                status = safe_strip(day_data.get(sub, ""))
+
                 if status == "Н":
                     row.append("Н"); n_hours += HOURS_PER_SUB
                 elif status == "Б":
@@ -322,9 +354,21 @@ DEFAULT_TASKS = []
 
 # ==================== ЗАГРУЗКА ДАННЫХ ====================
 users = load_data("users", DEFAULT_USERS)
+if not isinstance(users, dict) or not users:
+    users = DEFAULT_USERS
+
 students = load_data("students", DEFAULT_STUDENTS)
+if not isinstance(students, list) or not students:
+    students = DEFAULT_STUDENTS
+students = [safe_str(s) for s in students if safe_str(s)]
+
 attendance = load_data("attendance", DEFAULT_ATTENDANCE)
+if not isinstance(attendance, dict):
+    attendance = DEFAULT_ATTENDANCE
+
 tasks = load_data("tasks", DEFAULT_TASKS)
+if not isinstance(tasks, list):
+    tasks = DEFAULT_TASKS
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -340,10 +384,19 @@ if not st.session_state.logged_in:
     login = st.text_input("Логин")
     pwd = st.text_input("Пароль", type="password")
     if st.button("Войти"):
-        if login in users and verify_password(pwd, users[login]["password"]):
-            st.session_state.logged_in = True
-            st.session_state.user = {**users[login], "login": login}
-            st.rerun()
+        login_clean = safe_strip(login)
+        if login_clean in users:
+            u = users.get(login_clean)
+            if isinstance(u, dict) and verify_password(pwd, u.get("password", "")):
+                st.session_state.logged_in = True
+                st.session_state.user = {
+                    "login": login_clean,
+                    "role": safe_str(u.get("role", "student")),
+                    "name": safe_str(u.get("name", login_clean)),
+                }
+                st.rerun()
+            else:
+                st.error("Неверный логин или пароль")
         else:
             st.error("Неверный логин или пароль")
 
@@ -361,7 +414,7 @@ else:
 
     st.title("Панель группы ИС-116")
 
-    # ====== ВКЛАДКИ: у staff — 3, у студента — только «Домашка» ======
+    # ====== ВКЛАДКИ ======
     if is_staff:
         tab_attendance, tab_tasks, tab_students = st.tabs(
             ["📋 Посещаемость", "📝 Домашние задания", "👥 Студенты"]
@@ -371,7 +424,7 @@ else:
         tab_attendance = None
         tab_students = None
 
-    # ==================== ПОСЕЩАЕМОСТЬ (только staff) ====================
+    # ==================== ПОСЕЩАЕМОСТЬ ====================
     if tab_attendance is not None:
         with tab_attendance:
             st.subheader("Журнал посещаемости")
@@ -386,16 +439,18 @@ else:
             with col_w:
                 st.info(f"Выбранная дата: **{date_str}** ({day_name})")
 
-            if date_str not in attendance:
+            # Инициализация данных за дату
+            if date_str not in attendance or not isinstance(attendance.get(date_str), dict):
                 attendance[date_str] = {
                     name: {sub: "" for sub in SUB_COLS} for name in students
                 }
-            for name in students:
-                if name not in attendance[date_str]:
-                    attendance[date_str][name] = {sub: "" for sub in SUB_COLS}
-                else:
-                    for sub in SUB_COLS:
-                        attendance[date_str][name].setdefault(sub, "")
+            else:
+                for name in students:
+                    if name not in attendance[date_str] or not isinstance(attendance[date_str].get(name), dict):
+                        attendance[date_str][name] = {sub: "" for sub in SUB_COLS}
+                    else:
+                        for sub in SUB_COLS:
+                            attendance[date_str][name].setdefault(sub, "")
 
             st.write("### Отметьте посещаемость по парам")
             st.caption(
@@ -403,11 +458,14 @@ else:
                 "**Б** — болен (уваж.), **О** — опоздал, пусто — не отмечено."
             )
 
+            # Собираем строки для data_editor
             editor_rows = []
             for name in students:
                 row = {"ФИО": name}
                 for sub in SUB_COLS:
-                    row[f"Пара {sub}"] = attendance[date_str][name].get(sub, "")
+                    row[f"Пара {sub}"] = safe_strip(
+                        attendance[date_str][name].get(sub, "")
+                    )
                 editor_rows.append(row)
 
             df_editor = pd.DataFrame(editor_rows)
@@ -435,9 +493,12 @@ else:
             with col_save:
                 if st.button("💾 Сохранить", type="primary", use_container_width=True):
                     for _, row in edited_df.iterrows():
-                        name = row["ФИО"]
+                        name = safe_strip(row.get("ФИО", ""))
+                        if not name:
+                            continue
                         for sub in SUB_COLS:
-                            attendance[date_str][name][sub] = row.get(f"Пара {sub}", "") or ""
+                            val = safe_strip(row.get(f"Пара {sub}", ""))
+                            attendance[date_str][name][sub] = val
                     save_data("attendance", attendance)
                     st.success(f"✅ Посещаемость за {date_str} сохранена.")
             with col_clear:
@@ -449,10 +510,12 @@ else:
                     st.rerun()
 
             st.divider()
+
+            # ==================== ОТЧЁТ ====================
             st.subheader("📊 Отчёт за неделю (в формате шаблона)")
             st.caption(
                 "Создаёт лист **«Посещаемость»** в Google Таблице. "
-                "1 пара = 2 акад. часа; **Н** и **Б** дают +2 часа каждый, **О** — опоздание."
+                "1 пара = 2 акад. часа; **Н** и **Б** дают +2 часа, **О** — опоздание."
             )
 
             week_offset = st.number_input(
@@ -480,19 +543,21 @@ else:
                         except Exception as e:
                             st.error(f"Ошибка при экспорте: {e}")
 
-    # ==================== ДОМАШНИЕ ЗАДАНИЯ (всем, редактирование — staff) ====================
+    # ==================== ДОМАШНИЕ ЗАДАНИЯ ====================
     with tab_tasks:
         st.subheader("📝 Домашние задания")
         if not is_staff:
             st.caption("Здесь вы видите список домашних заданий по предметам.")
 
-        # --- Метрики ---
+        # Метрики
         today_d = date.today()
         total = len(tasks)
-        done_cnt = sum(1 for t in tasks if t.get("done"))
+        done_cnt = sum(1 for t in tasks if isinstance(t, dict) and t.get("done"))
         active_cnt = total - done_cnt
         overdue_cnt = 0
         for t in tasks:
+            if not isinstance(t, dict):
+                continue
             if t.get("done"):
                 continue
             d = parse_date(t.get("deadline"))
@@ -505,7 +570,7 @@ else:
         m3.metric("Выполнено", done_cnt)
         m4.metric("Просрочено", overdue_cnt)
 
-        # --- Фильтры ---
+        # Фильтры
         fcol1, fcol2 = st.columns([1, 2])
         with fcol1:
             filter_status = st.selectbox(
@@ -517,29 +582,36 @@ else:
             )
 
         def _matches(t):
+            if not isinstance(t, dict):
+                return False
             if filter_status == "Активные" and t.get("done"):
                 return False
             if filter_status == "Выполненные" and not t.get("done"):
                 return False
-            if search and search.strip().lower() not in t.get("title", "").lower():
-                return False
+            if search:
+                needle = safe_strip(search).lower()
+                hay = safe_strip(t.get("title", "")).lower()
+                if needle and needle not in hay:
+                    return False
             return True
 
         st.divider()
 
-        # --- Группировка по предметам ---
+        # Группировка по предметам
         tasks_by_subject = {s: [] for s in SUBJECTS}
         other_tasks = []
         for t in tasks:
-            s = (t.get("subject") or "").strip()
+            if not isinstance(t, dict):
+                continue
+            s = safe_strip(t.get("subject", ""))
             if s in tasks_by_subject:
                 tasks_by_subject[s].append(t)
             else:
                 other_tasks.append(t)
 
         def _render_task(t, key_prefix):
-            tid = t.get("id", "")
-            is_done = t.get("done", False)
+            tid = safe_strip(t.get("id", ""))
+            is_done = bool(t.get("done", False))
             deadline_d = parse_date(t.get("deadline"))
             is_overdue = (not is_done) and deadline_d and deadline_d < today_d
             is_today = (not is_done) and deadline_d and deadline_d == today_d
@@ -548,23 +620,23 @@ else:
                 c1, c2 = st.columns([4, 1])
                 with c1:
                     icon = "✅" if is_done else "📌"
-                    st.markdown(f"{icon} **{t.get('title', '—')}**")
+                    st.markdown(f"{icon} **{safe_str(t.get('title', '—'))}**")
                     meta = []
                     if t.get("deadline"):
-                        dl = f"📅 {t['deadline']}"
+                        dl = f"📅 {safe_str(t['deadline'])}"
                         if is_overdue:
                             dl += "  🔴 *просрочено*"
                         elif is_today:
                             dl += "  🟠 *сегодня*"
                         meta.append(dl)
                     if t.get("priority"):
-                        meta.append(f"⚡ {t['priority']}")
+                        meta.append(f"⚡ {safe_str(t['priority'])}")
                     if t.get("created_at"):
-                        meta.append(f"🕓 {t['created_at']}")
+                        meta.append(f"🕓 {safe_str(t['created_at'])}")
                     if meta:
                         st.caption("  ·  ".join(meta))
                     if t.get("description"):
-                        st.write(t["description"])
+                        st.write(safe_str(t["description"]))
                     st.markdown(
                         f"**Статус:** {'✅ Выполнено' if is_done else '⏳ В работе'}"
                     )
@@ -577,7 +649,7 @@ else:
                             use_container_width=True,
                         ):
                             for x in tasks:
-                                if x.get("id") == tid:
+                                if isinstance(x, dict) and x.get("id") == tid:
                                     x["done"] = not x.get("done", False)
                             save_data("tasks", tasks)
                             st.rerun()
@@ -587,15 +659,21 @@ else:
                             help="Удалить задание",
                             use_container_width=True,
                         ):
-                            tasks[:] = [x for x in tasks if x.get("id") != tid]
+                            tasks[:] = [
+                                x for x in tasks
+                                if not (isinstance(x, dict) and x.get("id") == tid)
+                            ]
                             save_data("tasks", tasks)
                             st.rerun()
 
-        # --- Рендер по каждому предмету ---
+        # Рендер по предметам
         for s_idx, subj in enumerate(SUBJECTS):
             subj_all = tasks_by_subject[subj]
             subj_filtered = [t for t in subj_all if _matches(t)]
-            subj_active = sum(1 for t in subj_all if not t.get("done"))
+            subj_active = sum(
+                1 for t in subj_all
+                if isinstance(t, dict) and not t.get("done")
+            )
 
             h1, h2 = st.columns([9, 1])
             with h1:
@@ -611,7 +689,6 @@ else:
                     ):
                         st.session_state.add_task_subject = subj
 
-            # Форма добавления (если открыта для этого предмета)
             if is_staff and st.session_state.add_task_subject == subj:
                 with st.form(f"add_form_{s_idx}", clear_on_submit=True):
                     st.markdown(f"**Новое задание — «{subj}»**")
@@ -642,7 +719,7 @@ else:
                         )
 
                     if submitted:
-                        if not t_title.strip():
+                        if not safe_strip(t_title):
                             st.error("Название не может быть пустым.")
                         else:
                             tasks = add_task(
@@ -656,7 +733,6 @@ else:
                         st.session_state.add_task_subject = None
                         st.rerun()
 
-            # Список заданий
             if not subj_all:
                 st.caption("— пока нет заданий —")
             elif not subj_filtered:
@@ -667,14 +743,13 @@ else:
 
             st.divider()
 
-        # --- Прочие задания ---
         if other_tasks:
             with st.expander("📦 Задания без предмета / прочее"):
                 for t in other_tasks:
                     if _matches(t):
                         _render_task(t, key_prefix="other")
 
-    # ==================== СТУДЕНТЫ (только staff) ====================
+    # ==================== СТУДЕНТЫ ====================
     if tab_students is not None:
         with tab_students:
             st.write("Управление списком студентов")
